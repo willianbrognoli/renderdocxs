@@ -57,21 +57,47 @@ def health():
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
-    """Extrai o texto de um docx cru (transcrição ou questões)."""
+    """Extrai texto e imagens de um docx cru. Imagens do corpo viram
+    marcadores [IMAGEM n] no ponto exato do texto e são devolvidas em base64."""
+    import base64 as b64
     data = await file.read()
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
         xml = z.read('word/document.xml').decode('utf-8')
     except Exception as e:
         raise HTTPException(400, f"docx inválido: {e}")
+    try:
+        rels = z.read('word/_rels/document.xml.rels').decode('utf-8')
+        rel_map = dict(re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels))
+    except KeyError:
+        rel_map = {}
     paras = re.findall(r'<w:p(?: [^>]*)?/>|<w:p(?: [^>]*)?>.*?</w:p>', xml, re.S)
-    lines = []
+    lines, images, seen = [], [], {}
     for p in paras:
         t = ''.join(re.findall(r'<w:t[^>]*>([^<]*)</w:t>', p))
+        for rid in re.findall(r'r:embed="([^"]+)"', p):
+            target = rel_map.get(rid, '')
+            if 'media/' not in target:
+                continue
+            if target in seen:
+                t += ' [IMAGEM %d]' % seen[target]
+                continue
+            try:
+                raw = z.read('word/' + target.lstrip('/'))
+            except KeyError:
+                continue
+            if len(raw) < 3000:
+                continue  # ícone/decoração
+            n = len(images) + 1
+            seen[target] = n
+            ext = target.rsplit('.', 1)[-1].lower()
+            mime = 'image/png' if ext == 'png' else 'image/jpeg' if ext in ('jpg', 'jpeg') else 'image/' + ext
+            images.append({'n': n, 'mime': mime, 'base64': b64.b64encode(raw).decode('ascii')})
+            t += ' [IMAGEM %d]' % n
         lines.append(t)
     text = '\n'.join(lines)
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    return {"text": text, "chars": len(text)}
+    return {"text": text, "chars": len(text), "images": images}
 
 
 class RenderRequest(BaseModel):
