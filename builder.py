@@ -534,6 +534,18 @@ class Builder:
         self.add('<w:tbl>%s</w:tbl>' % ''.join(parts))
         self.blank()
 
+    # ---------- imagens ----------
+    def imagem(self, ref, legenda=None):
+        meta = getattr(self, '_img_meta', {}).get(str(ref))
+        if not meta:
+            return  # imagem referenciada mas não enviada: ignora sem quebrar
+        rid, cx, cy = meta
+        self._img_did = getattr(self, '_img_did', 9000) + 1
+        self.add(_DRAWING_TPL.format(rid=rid, cx=cx, cy=cy, did=self._img_did))
+        if legenda:
+            self.add(retext_para(self.f.caption, legenda))
+        self.blank()
+
     # ---------- questões ----------
     def questao(self, cabecalho, corpo, certo_errado=False):
         self.add(retext_para(self.f.q_cab, cabecalho))
@@ -637,13 +649,97 @@ class Builder:
 _DROP = object()
 
 
+
+
+# ---------------------------------------------------------------------------
+# imagens embutidas no material
+# ---------------------------------------------------------------------------
+
+def _img_dims(data):
+    """Largura/altura em pixels de PNG ou JPEG; fallback 800x600."""
+    try:
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            w = int.from_bytes(data[16:20], 'big')
+            h = int.from_bytes(data[20:24], 'big')
+            return w, h
+        if data[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(data) - 9:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                    h = int.from_bytes(data[i + 5:i + 7], 'big')
+                    w = int.from_bytes(data[i + 7:i + 9], 'big')
+                    return w, h
+                seg = int.from_bytes(data[i + 2:i + 4], 'big')
+                i += 2 + seg
+    except Exception:
+        pass
+    return 800, 600
+
+
+MAX_CX_EMU = 6096000  # ~16.1 cm, largura útil da página
+
+
+def prepare_images(imagens, template_path=TEMPLATE):
+    """Prepara imagens: decide rIds livres, dimensões e nomes de mídia.
+    imagens: dict ref(str) -> {"base64": ..., "mime": "image/png"}.
+    Devolve (meta ref->(rid, cx, cy), media_files, rels_extra)."""
+    import base64 as _b64
+    if not imagens:
+        return {}, {}, []
+    z = zipfile.ZipFile(template_path)
+    rels = z.read('word/_rels/document.xml.rels').decode('utf-8')
+    used = [int(m) for m in re.findall(r'Id="rId(\d+)"', rels)]
+    next_rid = max(used) + 1 if used else 100
+    meta, media, rels_extra = {}, {}, []
+    for ref in sorted(imagens.keys(), key=lambda x: int(x)):
+        info = imagens[ref]
+        raw = _b64.b64decode(info['base64'])
+        mime = info.get('mime', 'image/png')
+        ext = 'png' if 'png' in mime else ('jpeg' if ('jpeg' in mime or 'jpg' in mime) else 'png')
+        w, h = _img_dims(raw)
+        cx = int(w * 9525)
+        cy = int(h * 9525)
+        if cx > MAX_CX_EMU:
+            cy = int(cy * MAX_CX_EMU / cx)
+            cx = MAX_CX_EMU
+        fname = 'media/imagemAG%s.%s' % (ref, ext)
+        rid = 'rId%d' % next_rid
+        next_rid += 1
+        meta[str(ref)] = (rid, cx, cy)
+        media['word/' + fname] = raw
+        rels_extra.append(
+            '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/image" Target="%s"/>' % (rid, fname))
+    return meta, media, rels_extra
+
+
+_DRAWING_TPL = (
+    '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>'
+    '<wp:inline distT="0" distB="0" distL="0" distR="0" '
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+    '<wp:extent cx="{cx}" cy="{cy}"/>'
+    '<wp:docPr id="{did}" name="ImagemAG{did}"/>'
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+    '<pic:nvPicPr><pic:cNvPr id="{did}" name="ImagemAG{did}"/><pic:cNvPicPr/></pic:nvPicPr>'
+    '<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+    '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
+    '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>')
+
+
 # ---------------------------------------------------------------------------
 # documento completo a partir do JSON
 # ---------------------------------------------------------------------------
 
-def build_document(data, frag=None):
+def build_document(data, frag=None, prebuilt=None):
     f = frag or harvest()
-    b = Builder(f)
+    b = prebuilt or Builder(f)
     b.cover(data['titulo'])
     b.toc_placeholder()
     b.h1(data['titulo'])
@@ -679,6 +775,8 @@ def build_document(data, frag=None):
                 b.divergencia(blk['pergunta'], blk['posicoes'])
             elif t == 'revisao':
                 b.revisao(blk.get('titulo', 'HORA DE REVISAR'), blk['linhas'])
+            elif t == 'imagem':
+                b.imagem(blk.get('ref'), blk.get('legenda'))
 
     b.banner2('QUESTÕES PARA PRATICAR')
     for q in data.get('questoes', []):
@@ -700,7 +798,32 @@ def write_docx(builder, out_path, template_path=TEMPLATE, pages=None):
         builder._pages = pages
     doc_xml = builder.compose()
     shutil.copy(template_path, out_path)
-    _replace_in_zip(out_path, 'word/document.xml', doc_xml.encode('utf-8'))
+    extra = dict(getattr(builder, '_img_media', {}))
+    extra['word/document.xml'] = doc_xml.encode('utf-8')
+    rels_extra = getattr(builder, '_img_rels', [])
+    if rels_extra:
+        z = zipfile.ZipFile(template_path)
+        rels = z.read('word/_rels/document.xml.rels').decode('utf-8')
+        rels = rels.replace('</Relationships>', ''.join(rels_extra) + '</Relationships>')
+        extra['word/_rels/document.xml.rels'] = rels.encode('utf-8')
+    _replace_many_in_zip(out_path, extra)
+
+
+def _replace_many_in_zip(path, files):
+    tmp = path + '.tmp'
+    with zipfile.ZipFile(path) as zin, \
+            zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+        done = set()
+        for item in zin.infolist():
+            if item.filename in files:
+                zout.writestr(item, files[item.filename])
+                done.add(item.filename)
+            else:
+                zout.writestr(item, zin.read(item.filename))
+        for name, content in files.items():
+            if name not in done:
+                zout.writestr(name, content)
+    os.replace(tmp, path)
 
 
 def _replace_in_zip(path, name, content):
@@ -784,7 +907,10 @@ def paginate_toc(builder, docx_path, template_path=TEMPLATE):
 
 def render(data, out_path, template_path=TEMPLATE, paginate=True):
     f = harvest(template_path)
-    b = build_document(data, f)
+    b = Builder(f)
+    imagens = data.get('imagens') or {}
+    b._img_meta, b._img_media, b._img_rels = prepare_images(imagens, template_path)
+    b = build_document(data, f, prebuilt=b)
     write_docx(b, out_path, template_path)
     if paginate:
         try:
