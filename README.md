@@ -49,6 +49,14 @@ boxes, tabelas, questões, comentadas e gabarito), com highlight amarelo em FGV.
   }
 }
 ```
-"Errado (   )" após o enunciado, banners, cores e espaçamentos saem idênticos ao modelo.
+sem linhas de marcação Certo/Errado (padrão v4), banners, cores e espaçamentos saem idênticos ao modelo.
 O sumário é um campo TOC real: o serviço converte com LibreOffice, mede a página
 de cada título e grava os números; no Word, F9 também atualiza.
+
+
+## v4 (padrão do PDF de referência)
+- Marcas inline: **negrito**, __negrito sublinhado__, %%negrito vermelho%%. O /extract anota sublinhados e vermelhos do docx fonte com __ e %%.
+- Revisão: moldura dourada, título centrado, 2 colunas (chip escuro com tema em CAIXA ALTA centrado + itens com seta dourada em fonte de corpo, recuo deslocado).
+- Questões sem linhas "Certo (   )/Errado (   )". Banner final: GABARITO FINAL.
+- Títulos de mnemônico e pergunta/rótulos de divergência em preto.
+- Fontes da marca: o builder embute as fontes da pasta `fonts/` do serviço (ou `/usr/share/fonts/truetype/aguia`) dentro de cada docx gerado, garantindo a tipografia correta em qualquer máquina e na conversão para PDF.
