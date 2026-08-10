@@ -208,18 +208,34 @@ def retext_para(para_xml, text, keep_first_n_runs=0, highlight_fgv=True):
     ppr = ppr.group(0) if ppr else ''
     runs = _runs(para_xml)
     base_rpr, bold_rpr = '', None
+    base_found = False
     for r in runs:
         rp = _rpr(r)
         if re.search(r'<w:b\b', rp):
             if bold_rpr is None:
                 bold_rpr = rp
-        elif not base_rpr:
+        elif not base_found and T_RE.search(r):
+            # run normal COM texto: seu rPr (mesmo vazio = herda o estilo)
+            # é a formatação de corpo correta. rPr vazio NÃO é "não achei".
             base_rpr = rp
-    if not base_rpr and bold_rpr:
+            base_found = True
+    if not base_found and bold_rpr:
+        # só quando o parágrafo modelo é 100% negrito (ex.: rótulos)
         base_rpr = _strip_bold(bold_rpr)
     kept = ''.join(runs[:keep_first_n_runs])
     body = make_runs(text, base_rpr, bold_rpr, highlight_fgv)
     return '<w:p>%s%s%s</w:p>' % (ppr, kept, body)
+
+
+def _boldify(text):
+    """Marca o texto inteiro como negrito (para rótulos/títulos cujo parágrafo
+    modelo é todo bold e perderia o negrito no retext)."""
+    if text is None:
+        return text
+    t = str(text)
+    if not t.strip() or '**' in t:
+        return t
+    return '**%s**' % t
 
 
 def _patch_first_text(xml_frag, new_text):
@@ -364,7 +380,7 @@ class Builder:
 
     # ---------- boxes ----------
     def mnemonico(self, titulo, texto):
-        self.add(self._box_generic(self.f.box_mnemonico, [None, titulo, texto]))
+        self.add(self._box_generic(self.f.box_mnemonico, [None, _boldify(titulo), texto]))
         self.blank()
 
     def dica(self, texto):
@@ -373,13 +389,13 @@ class Builder:
 
     def lei(self, fonte, texto):
         parts = [t for t in texto.split('\n') if t.strip()]
-        self.add(self._box_generic(self.f.box_lei, [None, fonte, parts[0]],
+        self.add(self._box_generic(self.f.box_lei, [None, _boldify(fonte), parts[0]],
                                    clone_last_for=parts[1:]))
         self.blank()
 
     def jurisprudencia(self, tribunal, referencia, texto, observacao=None):
         ps = _paras(self.f.box_juris)
-        texts = ['JURISPRUDÊNCIA — %s' % tribunal, referencia, texto]
+        texts = [_boldify('JURISPRUDÊNCIA — %s' % tribunal), _boldify(referencia), texto]
         if observacao:
             texts.append(observacao)
         else:
@@ -402,7 +418,7 @@ class Builder:
     def aprofundando(self, titulo, texto):
         parts = [t for t in texto.split('\n') if t.strip()]
         self.add(self._box_generic(self.f.box_aprof,
-                                   ['Aprofundando: %s' % titulo, parts[0]],
+                                   [_boldify('Aprofundando: %s' % titulo), parts[0]],
                                    clone_last_for=parts[1:]))
         self.blank()
 
@@ -438,7 +454,7 @@ class Builder:
         runs = _runs(model)
         lead_rpr = _rpr(runs[0])
         base_rpr = _rpr(runs[1]) if len(runs) > 1 else _strip_bold(lead_rpr)
-        new_ps = [ps[0], retext_para(ps[1], pergunta)]
+        new_ps = [ps[0], retext_para(ps[1], _boldify(pergunta))]
         for pos in posicoes:
             lead = '<w:r>%s<w:t xml:space="preserve">%s: </w:t></w:r>' % (
                 lead_rpr, escape(pos['rotulo']))
@@ -484,7 +500,7 @@ class Builder:
         if n != len(old_cols):
             grid = '<w:tblGrid>%s</w:tblGrid>' % (
                 ('<w:gridCol w:w="%d"/>' % (10469 // n)) * n)
-        parts = [header_pr, grid, rebuild_row(hrow, colunas)]
+        parts = [header_pr, grid, rebuild_row(hrow, [_boldify(c) for c in colunas])]
         for i, linha in enumerate(linhas):
             parts.append(rebuild_row(brow_a if i % 2 == 0 else brow_b, linha))
         self.add('<w:tbl>%s</w:tbl>' % ''.join(parts))
@@ -493,6 +509,66 @@ class Builder:
         self.blank()
 
     def revisao(self, titulo, linhas):
+        """O box de revisão do modelo é uma tabela ANINHADA: tabela externa
+        (1 célula com borda dourada e fill claro) contendo o parágrafo do
+        título + tabela interna (linhas tema escuro | seta | bullets).
+        Regex não-guloso embaralha as duas, então aqui usamos parser real."""
+        from lxml import etree
+        W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        wrapper = (self.f.doc_header + self.f.box_revisao +
+                   '</w:body></w:document>')
+        root = etree.fromstring(wrapper.encode('utf-8'))
+        body = root.find(W + 'body')
+        outer = body.find(W + 'tbl')
+        outer_cell = outer.find(W + 'tr').find(W + 'tc')
+        inner = outer_cell.find(W + 'tbl')
+
+        # 1) título: primeiro w:p da célula externa (mantém rPr bold do modelo)
+        for p in outer_cell.findall(W + 'p'):
+            ts = p.findall('.//' + W + 't')
+            if ts:
+                ts[0].text = _sanitize(titulo)
+                for t in ts[1:]:
+                    t.text = ''
+                break
+
+        # 2) linhas da tabela interna: clona a primeira linha-modelo
+        inner_rows = inner.findall(W + 'tr')
+        row_model = inner_rows[0]
+        for r in inner_rows:
+            inner.remove(r)
+
+        def _retext_el(p_el, text):
+            xml = etree.tostring(p_el, encoding='unicode')
+            novo = retext_para(xml, text, highlight_fgv=False)
+            return etree.fromstring(
+                (self.f.doc_header + novo + '</w:body></w:document>')
+                .encode('utf-8')).find(W + 'body').find(W + 'p')
+
+        for linha in linhas:
+            row = copy.deepcopy(row_model)
+            tcs = row.findall(W + 'tc')
+            # célula 0: tema (branco bold sobre célula escura do modelo)
+            c0 = tcs[0]
+            ps0 = c0.findall(W + 'p')
+            c0.replace(ps0[0], _retext_el(ps0[0], _boldify(linha['tema'])))
+            for extra in ps0[1:]:
+                c0.remove(extra)
+            # célula 1: seta (verbatim, já veio no deepcopy)
+            # célula 2: bullets
+            c2 = tcs[2]
+            ps2 = c2.findall(W + 'p')
+            bullet_model = ps2[0]
+            for old in ps2:
+                c2.remove(old)
+            for it in linha['itens']:
+                c2.append(_retext_el(bullet_model, '\u2022  %s' % it))
+            inner.append(row)
+
+        self.add(etree.tostring(outer, encoding='unicode'))
+        self.blank()
+
+    def _revisao_legacy(self, titulo, linhas):
         tbl = self.f.box_revisao
         rows = re.findall(r'<w:tr(?: [^>]*)?>.*?</w:tr>', tbl, re.S)
         hrow, brow = rows[0], rows[1]
@@ -552,16 +628,39 @@ class Builder:
         for linha in corpo:
             self.add(retext_para(self.f.q_corpo, linha))
         if certo_errado:
+            # o modelo traz as duas linhas de marcação: Certo (   ) e Errado (   )
+            certo = re.sub(r'(<w:t[^>]*>)Errado ', r'\1Certo ', self.f.q_marker,
+                           count=1)
+            self.add(certo)
             self.add(self.f.q_marker)
         self.add(self.f.q_corpo_blank)
         self.add(self.f.q_espaco)
+
+    def _lead_para(self, model, lead_text, body_text):
+        """Parágrafo com rótulo em negrito (rPr clonado do primeiro run do
+        modelo, ex.: "GABARITO: ") seguido do corpo em formatação normal,
+        com suporte a **negrito** e highlight FGV."""
+        ppr = re.search(r'<w:pPr>.*?</w:pPr>', model, re.S)
+        ppr = ppr.group(0) if ppr else ''
+        runs = _runs(model)
+        lead_rpr = _rpr(runs[0]) if runs else '<w:rPr><w:b/></w:rPr>'
+        base_rpr = ''
+        for r in runs[1:]:
+            rp = _rpr(r)
+            if not re.search(r'<w:b\b', rp) and T_RE.search(r):
+                base_rpr = rp
+                break
+        lead = '<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r>' % (
+            lead_rpr, escape(_sanitize(lead_text)))
+        body = make_runs(body_text, base_rpr)
+        return '<w:p>%s%s%s</w:p>' % (ppr, lead, body)
 
     def comentario(self, cabecalho, corpo, gabarito, comentario):
         self.add(retext_para(self.f.q_cab, cabecalho))
         for linha in corpo:
             self.add(retext_para(self.f.q_corpo, linha))
-        self.add(retext_para(self.f.c_gab, 'GABARITO: %s' % gabarito))
-        self.add(retext_para(self.f.c_com, 'COMENTÁRIO: %s' % comentario))
+        self.add(self._lead_para(self.f.c_gab, 'GABARITO: ', gabarito))
+        self.add(self._lead_para(self.f.c_com, 'COMENTÁRIO: ', comentario))
         self.add(self.f.q_espaco)
 
     def gabarito(self, entradas):
@@ -594,13 +693,13 @@ class Builder:
             return '<w:tr>%s%s</w:tr>' % (trpr, ''.join(new_cells))
 
         parts = [header_pr, grid,
-                 build_row(hrow, ['QUESTÃO', 'GABARITO'] * 3)]
+                 build_row(hrow, [_boldify('QUESTÃO'), _boldify('GABARITO')] * 3)]
         for r in range(nrows):
             vals = []
             for c in range(3):
                 if r < len(cols[c]):
                     e = cols[c][r]
-                    vals += [str(e['n']), str(e['g'])]
+                    vals += [_boldify(str(e['n'])), _boldify(str(e['g']))]
                 else:
                     vals += ['', '']
             parts.append(build_row(brow_a if r % 2 == 0 else brow_b, vals))
@@ -891,15 +990,32 @@ def paginate_toc(builder, docx_path, template_path=TEMPLATE):
         pages_txt = txt.split('\f')
         toc_page = next((pi for pi, p in enumerate(pages_txt, 1)
                          if 'SUM' in p and 'RIO' in p), 2)
+        # Busca em ORDEM de documento com fronteira monotônica: cada seção
+        # está numa página >= a da anterior. Match primário: o título ocupa
+        # uma linha inteira (é assim que banners e H1 saem no PDF); isso evita
+        # que "GABARITO" case com as linhas "GABARITO: X" das comentadas.
         pages = {}
+        floor = toc_page + 1
+        total = len(pages_txt)
+
+        def _lines(ptxt):
+            return [re.sub(r'\s+', ' ', ln).strip() for ln in ptxt.splitlines()]
+
         for name, title, level in builder.bm.items:
             norm = re.sub(r'\s+', ' ', title).strip()
-            for pi, ptxt in enumerate(pages_txt, 1):
-                if pi <= toc_page:
-                    continue
-                if norm in re.sub(r'\s+', ' ', ptxt):
-                    pages[name] = str(pi)
+            found = None
+            for pi in range(floor, total + 1):
+                if norm in _lines(pages_txt[pi - 1]):
+                    found = pi
                     break
+            if found is None:  # fallback: substring, ainda respeitando a ordem
+                for pi in range(floor, total + 1):
+                    if norm in re.sub(r'\s+', ' ', pages_txt[pi - 1]):
+                        found = pi
+                        break
+            if found is not None:
+                pages[name] = str(found)
+                floor = found
         builder._pages = pages
         write_docx(builder, docx_path, template_path, pages=pages)
         return True
