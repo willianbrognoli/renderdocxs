@@ -57,8 +57,10 @@ def health():
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
-    """Extrai texto e imagens de um docx cru. Imagens do corpo viram
-    marcadores [IMAGEM n] no ponto exato do texto e são devolvidas em base64."""
+    """Extrai texto e imagens de um docx cru, preservando as marcações do
+    professor: runs sublinhados viram __texto__ e runs em vermelho viram
+    %%texto%%. Imagens do corpo viram marcadores [IMAGEM n] no ponto exato
+    do texto e são devolvidas em base64."""
     import base64 as b64
     data = await file.read()
     try:
@@ -71,10 +73,39 @@ async def extract(file: UploadFile = File(...)):
         rel_map = dict(re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels))
     except KeyError:
         rel_map = {}
+
+    RUN_RE = re.compile(r'<w:r(?: [^>]*)?>.*?</w:r>', re.S)
+
+    def _marcas(run):
+        rpr = re.search(r'<w:rPr>.*?</w:rPr>', run, re.S)
+        rpr = rpr.group(0) if rpr else ''
+        sub = re.search(r'<w:u w:val="(?!none)', rpr) is not None
+        verm = False
+        m = re.search(r'<w:color w:val="([0-9A-Fa-f]{6})"', rpr)
+        if m:
+            h = m.group(1)
+            r_, g_, b_ = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            verm = r_ > 120 and g_ < 90 and b_ < 90
+        return sub, verm
+
     paras = re.findall(r'<w:p(?: [^>]*)?/>|<w:p(?: [^>]*)?>.*?</w:p>', xml, re.S)
     lines, images, seen = [], [], {}
     for p in paras:
-        t = ''.join(re.findall(r'<w:t[^>]*>([^<]*)</w:t>', p))
+        partes = []
+        for run in RUN_RE.findall(p):
+            t = ''.join(re.findall(r'<w:t[^>]*>([^<]*)</w:t>', run))
+            if not t:
+                continue
+            if t.strip():
+                sub, verm = _marcas(run)
+                if verm:
+                    t = '%%' + t + '%%'
+                elif sub:
+                    t = '__' + t + '__'
+            partes.append(t)
+        t = ''.join(partes)
+        # funde marcas de runs adjacentes: __a____b__ -> __ab__
+        t = t.replace('%%%%', '').replace('____', '')
         for rid in re.findall(r'r:embed="([^"]+)"', p):
             target = rel_map.get(rid, '')
             if 'media/' not in target:
