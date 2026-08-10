@@ -170,18 +170,42 @@ def _sanitize(text):
     return text.replace('\u00a0', ' ')
 
 
+_TOKEN_RE = re.compile(r'(\*\*.+?\*\*|__.+?__|%%.+?%%)', re.S)
+
+
+def _with_props(rpr, bold=False, underline=False, color=None):
+    """Deriva um rPr acrescentando negrito/sublinhado/cor ao existente."""
+    inner = re.sub(r'^<w:rPr>|</w:rPr>$', '', rpr) if rpr else ''
+    if color is not None:
+        inner = re.sub(r'<w:color [^/]*/>', '', inner)
+        inner += '<w:color w:val="%s"/>' % color
+    if bold and '<w:b' not in inner:
+        inner = '<w:b/>' + inner
+    if underline and '<w:u ' not in inner:
+        inner += '<w:u w:val="single"/>'
+    return '<w:rPr>%s</w:rPr>' % inner if inner else ''
+
+
 def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
-    """Converte texto com **negrito** em runs; FGV recebe highlight amarelo."""
+    """Converte texto com marcas inline em runs:
+    **negrito**  __negrito sublinhado__  %%negrito vermelho%%
+    FGV recebe highlight amarelo."""
     if bold_rpr is None:
         bold_rpr = _add_bold(base_rpr)
     out = []
-    parts = re.split(r'(\*\*.*?\*\*)', _sanitize(text))
-    for part in parts:
+    for part in _TOKEN_RE.split(_sanitize(text)):
         if not part:
             continue
-        bold = part.startswith('**') and part.endswith('**') and len(part) > 4
-        txt = part[2:-2] if bold else part
-        rpr = bold_rpr if bold else base_rpr
+        if part.startswith('**') and part.endswith('**') and len(part) > 4:
+            txt, rpr = part[2:-2], bold_rpr
+        elif part.startswith('__') and part.endswith('__') and len(part) > 4:
+            txt, rpr = part[2:-2], _with_props(bold_rpr, bold=True,
+                                               underline=True)
+        elif part.startswith('%%') and part.endswith('%%') and len(part) > 4:
+            txt, rpr = part[2:-2], _with_props(base_rpr, bold=True,
+                                               color='C00000')
+        else:
+            txt, rpr = part, base_rpr
         if highlight_fgv and 'FGV' in txt:
             for piece in re.split(r'(FGV)', txt):
                 if not piece:
@@ -380,7 +404,8 @@ class Builder:
 
     # ---------- boxes ----------
     def mnemonico(self, titulo, texto):
-        self.add(self._box_generic(self.f.box_mnemonico, [None, _boldify(titulo), texto]))
+        box = self._box_generic(self.f.box_mnemonico, [None, _boldify(titulo), texto])
+        self.add(box.replace('<w:color w:val="7A2E2E"', '<w:color w:val="000000"'))
         self.blank()
 
     def dica(self, texto):
@@ -464,8 +489,9 @@ class Builder:
         cell = re.search(r'<w:tc>.*?</w:tc>', box, re.S).group(0)
         tcpr = re.search(r'<w:tcPr>.*?</w:tcPr>', cell, re.S).group(0)
         new_cell = '<w:tc>%s%s</w:tc>' % (tcpr, ''.join(new_ps))
-        self.add(re.sub(r'<w:tc>.*?</w:tc>', lambda m: new_cell, box,
-                        count=1, flags=re.S))
+        out = re.sub(r'<w:tc>.*?</w:tc>', lambda m: new_cell, box,
+                     count=1, flags=re.S)
+        self.add(out.replace('<w:color w:val="7A2E2E"', '<w:color w:val="000000"'))
         self.blank()
 
     # ---------- tabelas ----------
@@ -509,10 +535,10 @@ class Builder:
         self.blank()
 
     def revisao(self, titulo, linhas):
-        """O box de revisão do modelo é uma tabela ANINHADA: tabela externa
-        (1 célula com borda dourada e fill claro) contendo o parágrafo do
-        título + tabela interna (linhas tema escuro | seta | bullets).
-        Regex não-guloso embaralha as duas, então aqui usamos parser real."""
+        """Layout v4 (PDF de referência): moldura dourada do template com o
+        título centrado, e por dentro uma tabela de 2 colunas: chip escuro com
+        o tema em CAIXA ALTA centrado + itens com seta dourada, em fonte de
+        corpo e linhas compactas."""
         from lxml import etree
         W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
         wrapper = (self.f.doc_header + self.f.box_revisao +
@@ -523,47 +549,79 @@ class Builder:
         outer_cell = outer.find(W + 'tr').find(W + 'tc')
         inner = outer_cell.find(W + 'tbl')
 
-        # 1) título: primeiro w:p da célula externa (mantém rPr bold do modelo)
+        # 1) título: primeiro w:p da célula externa, texto novo e centrado
         for p in outer_cell.findall(W + 'p'):
             ts = p.findall('.//' + W + 't')
             if ts:
                 ts[0].text = _sanitize(titulo)
                 for t in ts[1:]:
                     t.text = ''
+                ppr = p.find(W + 'pPr')
+                if ppr is None:
+                    ppr = etree.SubElement(p, W + 'pPr')
+                    p.remove(ppr)
+                    p.insert(0, ppr)
+                jc = ppr.find(W + 'jc')
+                if jc is None:
+                    jc = etree.SubElement(ppr, W + 'jc')
+                jc.set(W + 'val', 'center')
                 break
 
-        # 2) linhas da tabela interna: clona a primeira linha-modelo
-        inner_rows = inner.findall(W + 'tr')
-        row_model = inner_rows[0]
-        for r in inner_rows:
-            inner.remove(r)
+        # 2) largura total herdada do grid interno do template
+        grid = inner.find(W + 'tblGrid')
+        total = sum(int(g.get(W + 'w', '0') or 0)
+                    for g in grid.findall(W + 'gridCol')) or 10229
+        tema_w = 2900
+        item_w = total - tema_w
 
-        def _retext_el(p_el, text):
-            xml = etree.tostring(p_el, encoding='unicode')
-            novo = retext_para(xml, text, highlight_fgv=False)
-            return etree.fromstring(
-                (self.f.doc_header + novo + '</w:body></w:document>')
-                .encode('utf-8')).find(W + 'body').find(W + 'p')
-
+        _sp = ('<w:pPr><w:spacing w:before="20" w:after="20" w:line="240" '
+               'w:lineRule="auto"/><w:ind w:left="240" w:hanging="240"/>%s'
+               '</w:pPr>')
+        rows = []
         for linha in linhas:
-            row = copy.deepcopy(row_model)
-            tcs = row.findall(W + 'tc')
-            # célula 0: tema (branco bold sobre célula escura do modelo)
-            c0 = tcs[0]
-            ps0 = c0.findall(W + 'p')
-            c0.replace(ps0[0], _retext_el(ps0[0], _boldify(linha['tema'])))
-            for extra in ps0[1:]:
-                c0.remove(extra)
-            # célula 1: seta (verbatim, já veio no deepcopy)
-            # célula 2: bullets
-            c2 = tcs[2]
-            ps2 = c2.findall(W + 'p')
-            bullet_model = ps2[0]
-            for old in ps2:
-                c2.remove(old)
-            for it in linha['itens']:
-                c2.append(_retext_el(bullet_model, '\u2022  %s' % it))
-            inner.append(row)
+            itens = ''.join(
+                '<w:p>%s<w:r><w:rPr><w:b/><w:color w:val="C9A227"/></w:rPr>'
+                '<w:t xml:space="preserve">\u21d2 </w:t></w:r>%s</w:p>'
+                % (_sp % '<w:jc w:val="left"/>',
+                   make_runs(str(it), '', highlight_fgv=False))
+                for it in linha['itens'])
+            tema_p = ('<w:p><w:pPr><w:spacing w:before="20" w:after="20" '
+                      'w:line="240" w:lineRule="auto"/><w:jc w:val="center"/>'
+                      '</w:pPr><w:r><w:rPr><w:b/><w:color w:val="FFFFFF"/>'
+                      '<w:sz w:val="21"/></w:rPr><w:t xml:space="preserve">%s'
+                      '</w:t></w:r></w:p>'
+                      % escape(_sanitize(str(linha['tema'])).upper()))
+            tema_tc = ('<w:tc><w:tcPr><w:tcW w:w="%d" w:type="dxa"/>'
+                       '<w:tcBorders>'
+                       '<w:top w:val="single" w:sz="24" w:color="F1E9D2"/>'
+                       '<w:bottom w:val="single" w:sz="24" w:color="F1E9D2"/>'
+                       '<w:right w:val="single" w:sz="48" w:color="F1E9D2"/>'
+                       '</w:tcBorders>'
+                       '<w:shd w:val="clear" w:color="auto" w:fill="3B3B3B"/>'
+                       '<w:vAlign w:val="center"/></w:tcPr>%s</w:tc>'
+                       % (tema_w, tema_p))
+            item_tc = ('<w:tc><w:tcPr><w:tcW w:w="%d" w:type="dxa"/>'
+                       '<w:shd w:val="clear" w:color="auto" w:fill="F1E9D2"/>'
+                       '<w:vAlign w:val="center"/>'
+                       '<w:tcMar><w:left w:w="140" w:type="dxa"/></w:tcMar>'
+                       '</w:tcPr>%s</w:tc>' % (item_w, itens))
+            rows.append('<w:tr><w:trPr><w:cantSplit/></w:trPr>%s%s</w:tr>'
+                        % (tema_tc, item_tc))
+
+        new_inner_xml = ('<w:tbl><w:tblPr><w:tblW w:w="%d" w:type="dxa"/>'
+                         '<w:tblLayout w:type="fixed"/>'
+                         '<w:tblCellMar><w:top w:w="30" w:type="dxa"/>'
+                         '<w:left w:w="60" w:type="dxa"/>'
+                         '<w:bottom w:w="30" w:type="dxa"/>'
+                         '<w:right w:w="60" w:type="dxa"/></w:tblCellMar>'
+                         '</w:tblPr>'
+                         '<w:tblGrid><w:gridCol w:w="%d"/><w:gridCol w:w="%d"/>'
+                         '</w:tblGrid>%s</w:tbl>'
+                         % (total, tema_w, item_w, ''.join(rows)))
+        new_inner = etree.fromstring(
+            (self.f.doc_header + new_inner_xml + '</w:body></w:document>')
+            .encode('utf-8')).find(W + 'body').find(W + 'tbl')
+        outer_cell.replace(inner, new_inner)
 
         self.add(etree.tostring(outer, encoding='unicode'))
         self.blank()
@@ -627,12 +685,7 @@ class Builder:
         self.add(retext_para(self.f.q_cab, cabecalho))
         for linha in corpo:
             self.add(retext_para(self.f.q_corpo, linha))
-        if certo_errado:
-            # o modelo traz as duas linhas de marcação: Certo (   ) e Errado (   )
-            certo = re.sub(r'(<w:t[^>]*>)Errado ', r'\1Certo ', self.f.q_marker,
-                           count=1)
-            self.add(certo)
-            self.add(self.f.q_marker)
+        # padrão v4 (PDF de referência): sem linhas "Certo (   )/Errado (   )"
         self.add(self.f.q_corpo_blank)
         self.add(self.f.q_espaco)
 
@@ -873,7 +926,7 @@ def build_document(data, frag=None, prebuilt=None):
             elif t == 'divergencia':
                 b.divergencia(blk['pergunta'], blk['posicoes'])
             elif t == 'revisao':
-                b.revisao(blk.get('titulo', 'HORA DE REVISAR'), blk['linhas'])
+                b.revisao(blk.get('titulo', 'O QUE ESTUDEI'), blk['linhas'])
             elif t == 'imagem':
                 b.imagem(blk.get('ref'), blk.get('legenda'))
 
@@ -886,7 +939,7 @@ def build_document(data, frag=None, prebuilt=None):
         b.comentario(q['cabecalho'], q.get('corpo', []), q['gabarito'],
                      q['comentario'])
 
-    b.banner2('GABARITO')
+    b.banner2('GABARITO FINAL')
     b.add(f.esp_cap)
     b.gabarito(data['gabarito'])
     return b
