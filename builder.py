@@ -994,6 +994,145 @@ def _replace_in_zip(path, name, content):
 # fontes embutidas (deobfuscação) + paginação do sumário via LibreOffice
 # ---------------------------------------------------------------------------
 
+def _sfnt_info(path):
+    """Lê família e estilo (bold/itálico) de um TTF/OTF pelo name table e OS/2."""
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    try:
+        num = struct.unpack('>H', data[4:6])[0]
+        tables = {}
+        for i in range(num):
+            off = 12 + 16 * i
+            tag = data[off:off + 4].decode('latin1')
+            toff, tlen = struct.unpack('>II', data[off + 8:off + 16])
+            tables[tag] = (toff, tlen)
+
+        def _name(nid_pref):
+            toff, _ = tables['name']
+            cnt, stroff = struct.unpack('>HH', data[toff + 2:toff + 6])
+            best = None
+            for i in range(cnt):
+                r = toff + 6 + 12 * i
+                pid, eid, lid, nid, ln, so = struct.unpack('>6H', data[r:r + 12])
+                if nid not in nid_pref:
+                    continue
+                raw = data[toff + stroff + so:toff + stroff + so + ln]
+                try:
+                    val = raw.decode('utf-16-be') if pid in (0, 3) else raw.decode('latin1')
+                except Exception:
+                    continue
+                score = (nid_pref.index(nid), 0 if (pid, lid) == (3, 0x409) else 1)
+                if best is None or score < best[0]:
+                    best = (score, val)
+            return best[1] if best else ''
+
+        family = _name([16, 1])
+        sub = _name([17, 2]).lower()
+        bold = italic = False
+        if 'OS/2' in tables:
+            toff, _ = tables['OS/2']
+            fs = struct.unpack('>H', data[toff + 62:toff + 64])[0]
+            italic = bool(fs & 0x01)
+            bold = bool(fs & 0x20)
+        bold = bold or 'bold' in sub
+        italic = italic or 'italic' in sub or 'oblique' in sub
+        return family.strip(), bold, italic
+    except Exception:
+        return '', False, False
+
+
+def _brand_font_dirs():
+    dirs = []
+    for d in (os.path.join(HERE, 'fonts'),
+              '/usr/share/fonts/truetype/aguia'):
+        if os.path.isdir(d):
+            dirs.append(d)
+    return dirs
+
+
+def embed_brand_fonts(docx_path):
+    """Embute as fontes reais da marca (pasta fonts/ do serviço) dentro do
+    docx gerado, para o arquivo renderizar certo em qualquer máquina e na
+    conversão para PDF (o template só embute as fontes Microsoft)."""
+    import uuid
+    dirs = _brand_font_dirs()
+    if not dirs:
+        return 0
+    z = zipfile.ZipFile(docx_path)
+    ftable = z.read('word/fontTable.xml').decode('utf-8')
+    try:
+        rels = z.read('word/_rels/fontTable.xml.rels').decode('utf-8')
+    except KeyError:
+        rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/'
+                'package/2006/relationships"></Relationships>')
+    ctypes = z.read('[Content_Types].xml').decode('utf-8')
+    settings = z.read('word/settings.xml').decode('utf-8')
+    z.close()
+
+    doc_fonts = re.findall(r'<w:font w:name="([^"]+)"', ftable)
+    norm = lambda s: re.sub(r'\s+', ' ', s).strip().lower()
+    doc_map = {norm(n): n for n in doc_fonts}
+
+    used = [int(m) for m in re.findall(r'Id="rId(\d+)"', rels)] or [0]
+    next_rid = max(used) + 1
+    extra, added = {}, 0
+    seq = 100
+    for d in dirs:
+        for fn in sorted(os.listdir(d)):
+            if not fn.lower().endswith(('.ttf', '.otf')):
+                continue
+            fam, bold, italic = _sfnt_info(os.path.join(d, fn))
+            target = doc_map.get(norm(fam))
+            if not target:
+                continue
+            slot = 'embed' + ('BoldItalic' if bold and italic else
+                              'Bold' if bold else
+                              'Italic' if italic else 'Regular')
+            # remove embed antigo do mesmo slot nessa fonte
+            blk = re.search(r'<w:font w:name="%s"[^>]*>.*?</w:font>'
+                            % re.escape(target), ftable, re.S)
+            if not blk:
+                continue
+            bloco = re.sub(r'<w:%s [^/]*/>' % slot, '', blk.group(0))
+            guid = str(uuid.uuid4()).upper()
+            raw = bytearray(open(os.path.join(d, fn), 'rb').read())
+            kb = bytes.fromhex(guid.replace('-', ''))[::-1]
+            for i in range(min(32, len(raw))):
+                raw[i] ^= kb[i % 16]
+            seq += 1
+            fname = 'fontAG%d.odttf' % seq
+            rid = 'rId%d' % next_rid
+            next_rid += 1
+            bloco = bloco.replace(
+                '</w:font>',
+                '<w:%s r:id="%s" w:fontKey="{%s}"/></w:font>' % (slot, rid, guid))
+            ftable = ftable.replace(blk.group(0), bloco)
+            rels = rels.replace(
+                '</Relationships>',
+                '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/'
+                'officeDocument/2006/relationships/font" Target="fonts/%s"/>'
+                '</Relationships>' % (rid, fname))
+            extra['word/fonts/' + fname] = bytes(raw)
+            added += 1
+    if not added:
+        return 0
+    if 'Extension="odttf"' not in ctypes:
+        ctypes = ctypes.replace(
+            '</Types>',
+            '<Default Extension="odttf" ContentType="application/'
+            'vnd.openxmlformats-officedocument.obfuscatedFont"/></Types>')
+        extra['[Content_Types].xml'] = ctypes.encode('utf-8')
+    if '<w:embedTrueTypeFonts' not in settings:
+        settings = re.sub(r'(<w:settings[^>]*>)',
+                          r'\1<w:embedTrueTypeFonts/>', settings, count=1)
+        extra['word/settings.xml'] = settings.encode('utf-8')
+    extra['word/fontTable.xml'] = ftable.encode('utf-8')
+    extra['word/_rels/fontTable.xml.rels'] = rels.encode('utf-8')
+    _replace_many_in_zip(docx_path, extra)
+    return added
+
+
 def install_embedded_fonts(template_path=TEMPLATE):
     """Extrai as fontes .odttf do template, desofusca e instala no sistema
     para o LibreOffice paginar com a métrica correta."""
@@ -1087,4 +1226,8 @@ def render(data, out_path, template_path=TEMPLATE, paginate=True):
             paginate_toc(b, out_path, template_path)
         except Exception:
             pass
+    try:
+        embed_brand_fonts(out_path)
+    except Exception:
+        pass
     return out_path
