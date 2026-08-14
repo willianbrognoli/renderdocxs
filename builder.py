@@ -574,7 +574,10 @@ class Builder:
     def banner5(self, titulo):
         name = self.bm.new(titulo, 2)
         self.bm_id += 1
-        self.add(_with_bookmark(self.f.banner_t5, titulo, name, self.bm_id))
+        banner = _with_bookmark(self.f.banner_t5, titulo, name, self.bm_id)
+        # texto do banner "APRESENTAÇÃO" em dourado (era branco), mantendo o fundo escuro
+        banner = banner.replace('<w:color w:val="FFFFFF"', '<w:color w:val="9C7A21"')
+        self.add(banner)
 
     def trim_blanks(self):
         """Remove parágrafos vazios sobrando no fim do fluxo (eles são a
@@ -1216,7 +1219,7 @@ def build_document(data, frag=None, prebuilt=None):
     b.banner5('APRESENTAÇÃO')
     b.blank()
     for p in data.get('apresentacao', []):
-        b.para_dourado(p)
+        b.para(p)
 
     for cap in data.get('capitulos', []):
         b.banner2(cap['titulo'])
