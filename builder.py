@@ -511,7 +511,13 @@ class Builder:
         # respiro assimétrico: separa do assunto anterior (antes) e gruda no
         # conteúdo do próprio subtítulo (depois)
         espac = '<w:spacing w:before="360" w:after="120"/>'
-        extras = '<w:keepNext/>' + espac + borda
+        # v7.2.8: a moldura é desenhada `space` pontos para FORA do texto,
+        # mais a espessura da linha; sem recuo ela vazava além das margens
+        # da coluna. O recuo compensa exatamente esse deslocamento, deixando
+        # a borda externa alinhada com o texto do corpo.
+        recuo_tw = int(round((8 + int(sz) / 8.0) * 20))  # space(8pt)+linha, em twips
+        ind = '<w:ind w:left="%d" w:right="%d"/>' % (recuo_tw, recuo_tw)
+        extras = '<w:keepNext/>' + espac + ind + borda
         if '<w:pPr>' in p:
             if '<w:pStyle' in p:
                 p = re.sub(r'(<w:pStyle [^/]*/>)', r'\1' + extras, p, count=1)
