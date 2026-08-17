@@ -961,10 +961,15 @@ class Builder:
         caixa = [(cab + (' ' + resto if resto else '')).strip()]
         tem_alt = any(cls._ALT_RE.match(l) for l in corpo)
         if tem_alt:
-            # promove o enunciado para dentro da caixa (linhas com [IMAGEM n]
-            # permanecem no corpo: imagem não entra em parágrafo sombreado)
+            # promove o enunciado para dentro da caixa; linhas com [IMAGEM n]
+            # têm o texto anterior promovido e a imagem mantida no corpo
+            # (imagem não entra em parágrafo sombreado)
             while corpo and not cls._ALT_RE.match(corpo[0]):
                 if '[IMAGEM' in corpo[0]:
+                    antes, resto_img = corpo[0].split('[IMAGEM', 1)
+                    if antes.strip():
+                        caixa.append(antes.strip())
+                        corpo[0] = '[IMAGEM' + resto_img
                     break
                 l = corpo.pop(0).strip()
                 if l:
