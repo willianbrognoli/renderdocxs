@@ -345,8 +345,78 @@ class Builder:
         return re.sub(r'<w:tc>.*?</w:tc>', lambda m: new_cell, box, count=1, flags=re.S)
 
     # ---------- estrutura ----------
+    # v7.2.4: capa com título longo. A faixa do template comporta 2 linhas a
+    # 22pt; títulos que precisariam de 3+ linhas têm a fonte reduzida até
+    # caberem em 2 linhas (pedido do cliente). Se nem no piso couber,
+    # fallback: estica a faixa mantendo o centro.
+    _COVER_CHARS_POR_LINHA = 26   # calibrado na largura útil da caixa a 22pt
+    _COVER_SZ_BASE = 44           # 22pt (estilo TtuloCapa)
+    _COVER_SZ_MIN = 28            # 14pt: piso da redução
+    _COVER_EMU_POR_LINHA = 350000  # ~0,97 cm por linha extra (fallback)
+
+    @classmethod
+    def _cover_linhas(cls, titulo, limite=None):
+        limite = limite or cls._COVER_CHARS_POR_LINHA
+        linhas, atual = 1, ''
+        for w in str(titulo).split():
+            t = (atual + ' ' + w).strip()
+            if len(t) <= limite or not atual:
+                atual = t
+            else:
+                linhas += 1
+                atual = w
+        return linhas
+
+    @classmethod
+    def _cover_fit_sz(cls, titulo):
+        """Maior tamanho de fonte (half-points) que faz o título caber em
+        2 linhas; None quando o tamanho do estilo (22pt) já basta."""
+        if cls._cover_linhas(titulo) <= 2:
+            return None
+        sz = cls._COVER_SZ_BASE
+        while sz > cls._COVER_SZ_MIN:
+            sz -= 2
+            limite = int(cls._COVER_CHARS_POR_LINHA * cls._COVER_SZ_BASE / sz)
+            if cls._cover_linhas(titulo, limite) <= 2:
+                return sz
+        return cls._COVER_SZ_MIN
+
+    @staticmethod
+    def _cover_set_sz(box_inner, sz):
+        """Grava o tamanho de fonte em todos os runs da caixa de título."""
+        tag = '<w:sz w:val="%d"/><w:szCs w:val="%d"/>' % (sz, sz)
+
+        def rep(m):
+            run = m.group(0)
+            if '<w:rPr>' in run:
+                run = re.sub(r'<w:sz w:val="\d+"/>|<w:szCs w:val="\d+"/>', '', run)
+                return run.replace('<w:rPr>', '<w:rPr>' + tag, 1)
+            return re.sub(r'^(<w:r(?: [^>]*)?>)', r'\1<w:rPr>%s</w:rPr>' % tag,
+                          run, count=1)
+        return re.sub(r'<w:r(?: [^>]*)?>.*?</w:r>', rep, box_inner, flags=re.S)
+
+    @staticmethod
+    def _cover_grow(art, extra):
+        """Aumenta em `extra` EMU a altura de cada shape ancorada da arte do
+        título e sobe o offset vertical em extra/2 (centro preservado)."""
+        def patch(m):
+            bloco = m.group(0)
+            me = re.search(r'<wp:extent cx="\d+" cy="(\d+)"/>', bloco)
+            if not me:
+                return bloco
+            cy0 = me.group(1)
+            bloco = bloco.replace('cy="%s"' % cy0, 'cy="%d"' % (int(cy0) + extra))
+            bloco = re.sub(
+                r'(<wp:positionV[^>]*><wp:posOffset>)(\d+)(</w?p?:?posOffset>)',
+                lambda mm: mm.group(1) + str(max(0, int(mm.group(2)) - extra // 2))
+                + mm.group(3),
+                bloco)
+            return bloco
+        return re.sub(r'<wp:anchor\b.*?</wp:anchor>', patch, art, flags=re.S)
+
     def cover(self, titulo):
         self.add(self.f.cover_bg)
+        sz = self._cover_fit_sz(titulo)
 
         def fix_box(m):
             inner = m.group(0)
@@ -358,10 +428,19 @@ class Builder:
                     return ('<w:t xml:space="preserve">%s</w:t>'
                             % escape(titulo))
                 return '<w:t xml:space="preserve"></w:t>'
-            return T_RE.sub(rep, inner)
+            inner = T_RE.sub(rep, inner)
+            if sz:
+                inner = self._cover_set_sz(inner, sz)
+            return inner
 
         art = re.sub(r'<w:txbxContent>.*?</w:txbxContent>', fix_box,
                      self.f.cover_art, flags=re.S)
+        if sz:
+            limite = int(self._COVER_CHARS_POR_LINHA * self._COVER_SZ_BASE / sz)
+            linhas = self._cover_linhas(titulo, limite)
+            if linhas > 2:
+                art = self._cover_grow(
+                    art, (linhas - 2) * self._COVER_EMU_POR_LINHA)
         self.add(art)
 
     def toc_placeholder(self):
@@ -408,6 +487,11 @@ class Builder:
         self.add(_with_bookmark(self.f.banner_t2, titulo, name, self.bm_id))
         self.blank()
 
+    # v7.2.6: subtítulo no tamanho do corpo (12pt). O estilo Ttulo4 do
+    # template é 13pt em Winner Sans Wide (fonte larga), que aparenta ser
+    # bem maior que o texto; o tamanho é forçado nos runs.
+    _SUBTITLE_SZ = 24
+
     def subtitle(self, titulo):
         """O subtítulo do template é uma tabela de 1 célula (borda dourada),
         e tabela não tem keepNext: título ficava órfão no pé da página.
@@ -427,7 +511,13 @@ class Builder:
         # respiro assimétrico: separa do assunto anterior (antes) e gruda no
         # conteúdo do próprio subtítulo (depois)
         espac = '<w:spacing w:before="360" w:after="120"/>'
-        extras = '<w:keepNext/>' + espac + borda
+        # v7.2.8: a moldura é desenhada `space` pontos para FORA do texto,
+        # mais a espessura da linha; sem recuo ela vazava além das margens
+        # da coluna. O recuo compensa exatamente esse deslocamento, deixando
+        # a borda externa alinhada com o texto do corpo.
+        recuo_tw = int(round((8 + int(sz) / 8.0) * 20))  # space(8pt)+linha, em twips
+        ind = '<w:ind w:left="%d" w:right="%d"/>' % (recuo_tw, recuo_tw)
+        extras = '<w:keepNext/>' + espac + ind + borda
         if '<w:pPr>' in p:
             if '<w:pStyle' in p:
                 p = re.sub(r'(<w:pStyle [^/]*/>)', r'\1' + extras, p, count=1)
@@ -436,11 +526,23 @@ class Builder:
         else:
             p = re.sub(r'<w:p((?: [^>]*)?)>',
                        r'<w:p\1><w:pPr>' + extras + '</w:pPr>', p, count=1)
+        # força o tamanho de fonte do corpo em todos os runs do subtítulo
+        tag = ('<w:sz w:val="%d"/><w:szCs w:val="%d"/>'
+               % (self._SUBTITLE_SZ, self._SUBTITLE_SZ))
+
+        def _sz(mm):
+            run = mm.group(0)
+            run = re.sub(r'<w:sz w:val="\d+"/>|<w:szCs w:val="\d+"/>', '', run)
+            if '<w:rPr>' in run:
+                return run.replace('<w:rPr>', '<w:rPr>' + tag, 1)
+            return re.sub(r'^(<w:r(?: [^>]*)?>)', r'\1<w:rPr>%s</w:rPr>' % tag,
+                          run, count=1)
+        p = re.sub(r'<w:r(?: [^>]*)?>.*?</w:r>', _sz, p, flags=re.S)
         self.add(p)
 
     # ---------- boxes ----------
     def mnemonico(self, titulo, texto):
-        box = self._box_generic(self.f.box_mnemonico, [_boldify('MNEMÔNICO / BIZU'), _boldify(titulo), texto])
+        box = self._box_generic(self.f.box_mnemonico, [None, _boldify(titulo), texto])
         self.add(box.replace('<w:color w:val="7A2E2E"', '<w:color w:val="000000"'))
         self.blank()
 
@@ -782,11 +884,33 @@ class Builder:
     # ---------- questões ----------
     _IMG_MARK = re.compile(r'\[IMAGEM (\d+)\]')
 
+    # v7.2: linha que é só uma "opção" de Certo/Errado (ex.: "C) Certo",
+    # "E) Errado", "( ) Certo", "Certo."). Questão de Certo/Errado nunca
+    # lista opções; elas são removidas quando o corpo traz o par completo.
+    _CE_LINHA = re.compile(
+        r'^\s*\(?\s*[A-Ea-e]?\s*[).:\-]?\s*\(?\s*(certo|errado)\s*\)?\s*\.?\s*$',
+        re.I)
+
+    @classmethod
+    def _limpa_certo_errado(cls, corpo):
+        """Se o corpo trouxer linhas de opção 'Certo' E 'Errado', remove-as
+        (mantendo texto de apoio e afirmativa). Devolve o corpo filtrado."""
+        linhas = [str(x if x is not None else '') for x in (corpo or [])]
+        marca = [bool(cls._CE_LINHA.match(l.strip())) for l in linhas]
+        tem_c = any(m and re.search(r'certo', l, re.I)
+                    for l, m in zip(linhas, marca))
+        tem_e = any(m and re.search(r'errado', l, re.I)
+                    for l, m in zip(linhas, marca))
+        if not (tem_c and tem_e):
+            return linhas
+        return [l for l, m in zip(linhas, marca) if not m]
+
     def _linha_questao(self, modelo, linha):
         """Renderiza uma linha de questão; marcadores [IMAGEM N] viram a
         imagem real no ponto correspondente (questões com texto de apoio
-        visual, charge, campanha etc.)."""
-        s = str(linha)
+        visual, charge, campanha etc.). Sem vermelho nas seções de questões:
+        %%alerta%% rebaixa para negrito preto."""
+        s = str(linha).replace('%%', '**')
         marcas = self._IMG_MARK.findall(s)
         if not marcas:
             self.add(retext_para(modelo, s, highlight_fgv=False))
@@ -797,13 +921,121 @@ class Builder:
         for ref in marcas:
             self.imagem(ref)
 
+    # v7.2.6 (padrão CEBRASPE, imagem de referência do cliente):
+    # - cabecalho COM comando ("... julgue o item...") -> caixa cobre número +
+    #   banca + comando; enunciado/afirmativa descem no corpo, sem caixa.
+    # - cabecalho SEM comando -> caixa só em "NN. (BANCA / Órgão / Ano)" e
+    #   qualquer texto excedente desce para o corpo.
+    # - Se a IA mandar a questão inteira no cabecalho (corpo vazio), a 1ª
+    #   frase fica na caixa quando for comando (julgue/assinale); o resto cai
+    #   no corpo.
+    _COMANDO_RE = re.compile(r'\bjulgue\b|\bassinale\b', re.I)
+    _ALT_RE = re.compile(r'^\s*[A-Ea-e]\s*[).]\s+')
+
+    @staticmethod
+    def _separa_cabecalho(cab):
+        cab = str(cab or '')
+        if not re.match(r'^\s*\d+\s*[.)\-]?\s*\(', cab):
+            return cab, ''
+        i = cab.find('(')
+        depth = 0
+        for k in range(i, len(cab)):
+            if cab[k] == '(':
+                depth += 1
+            elif cab[k] == ')':
+                depth -= 1
+                if depth == 0:
+                    return cab[:k + 1].rstrip(), cab[k + 1:].strip()
+        return cab, ''
+
+    @classmethod
+    def _monta_sequencia(cls, cabecalho, corpo):
+        """Devolve [(tipo, linha)] com tipo 'caixa' (sombreado) ou 'corpo'.
+
+        Regra v7.2.9 (definida pelo cliente):
+        - Certo/Errado: caixa = numero + banca + comando; afirmativa fora.
+        - Multipla escolha: caixa = 1a linha (numero + banca + comando) e o
+          ENUNCIADO (ultima linha antes das alternativas); texto de apoio e
+          fonte (linha entre parenteses) ficam FORA, entre as duas caixas.
+          Alternativas sempre fora."""
+        corpo = [str(l if l is not None else '') for l in (corpo or [])]
+        cab, resto = cls._separa_cabecalho(cabecalho)
+        linha_cab = (cab + (' ' + resto if resto else '')).strip()
+        tem_alt = any(cls._ALT_RE.match(l) for l in corpo)
+        if tem_alt:
+            pre, alts = [], []
+            achou_alt = False
+            for l in corpo:
+                if not achou_alt and cls._ALT_RE.match(l):
+                    achou_alt = True
+                (alts if achou_alt else pre).append(l)
+            # enunciado = ultima linha pre-alternativas, exceto fonte "(...)"
+            # ou linha com imagem
+            enunciado = None
+            while pre:
+                ult = pre[-1].strip()
+                if not ult:
+                    pre.pop()
+                    continue
+                eh_fonte = bool(re.match(r'^\(.*\)[.\s]*$', ult))
+                if not eh_fonte and '[IMAGEM' not in ult:
+                    enunciado = pre.pop().strip()
+                break
+            seq = [('caixa', linha_cab)]
+            seq += [('corpo', l) for l in pre if str(l).strip()]
+            if enunciado:
+                seq.append(('caixa', enunciado))
+            seq += [('corpo', l) for l in alts]
+            return seq
+        # ---- Certo/Errado / sem alternativas ----
+        # comando veio como 1ª linha do corpo -> sobe para a caixa, junto ao
+        # cabeçalho (mesmo parágrafo, como na máscara)
+        if corpo and len([l for l in corpo if l.strip()]) >= 2 and not resto:
+            prim = corpo[0].strip()
+            if (prim and cls._COMANDO_RE.search(prim) and len(prim) <= 240
+                    and '[IMAGEM' not in prim):
+                linha_cab = (linha_cab + ' ' + prim).strip()
+                corpo = corpo[1:]
+        if not corpo and resto:
+            # tudo veio no cabecalho: 1a frase fica na caixa se for comando
+            m = re.match(r'([^.?!:]*[.?!:])\s*(.*)', resto, re.S)
+            if m and cls._COMANDO_RE.search(m.group(1)):
+                seq = [('caixa', (cab + ' ' + m.group(1)).strip())]
+                r2 = m.group(2).strip()
+                if r2:
+                    seq.append(('corpo', r2))
+                return seq
+            return [('caixa', cab), ('corpo', resto)]
+        return [('caixa', linha_cab)] + [('corpo', l) for l in corpo]
+
+    def _render_sequencia(self, seq):
+        for tipo, linha in seq:
+            if tipo == 'caixa':
+                self.add(retext_para(self.f.q_cab, linha, highlight_fgv=False))
+            else:
+                self._render_linha_corpo(linha)
+
+    def _render_linha_corpo(self, linha):
+        self._linha_questao(self.f.q_corpo, linha)
+
     def questao(self, cabecalho, corpo, certo_errado=False):
-        self.add(retext_para(self.f.q_cab, cabecalho, highlight_fgv=False))
-        for linha in corpo:
-            self._linha_questao(self.f.q_corpo, linha)
+        corpo = self._limpa_certo_errado(corpo)
+        self._render_sequencia(self._monta_sequencia(cabecalho, corpo))
         # padrão v4 (PDF de referência): sem linhas "Certo (   )/Errado (   )"
         self.add(self.f.q_corpo_blank)
         self.add(self.f.q_espaco)
+
+    @staticmethod
+    def _force_bold(rpr):
+        """Garante <w:b/> e cor preta no rPr (rótulos GABARITO:/COMENTÁRIO:
+        sempre em negrito preto, independente do run do template)."""
+        if not rpr:
+            return '<w:rPr><w:b/><w:color w:val="000000"/></w:rPr>'
+        rpr = re.sub(r'<w:color [^/>]*/>', '', rpr)
+        rpr = rpr.replace('</w:rPr>', '<w:color w:val="000000"/></w:rPr>', 1)
+        if not re.search(r'<w:b\b(?![A-Za-z])', rpr):
+            rpr = rpr.replace('<w:rPr>', '<w:rPr><w:b/>', 1)
+        return rpr
 
     def _lead_para(self, model, lead_text, body_text):
         """Parágrafo com rótulo em negrito (rPr clonado do primeiro run do
@@ -812,7 +1044,7 @@ class Builder:
         ppr = re.search(r'<w:pPr>.*?</w:pPr>', model, re.S)
         ppr = ppr.group(0) if ppr else ''
         runs = _runs(model)
-        lead_rpr = _rpr(runs[0]) if runs else '<w:rPr><w:b/></w:rPr>'
+        lead_rpr = self._force_bold(_rpr(runs[0]) if runs else '')
         base_rpr = ''
         for r in runs[1:]:
             rp = _rpr(r)
@@ -825,10 +1057,13 @@ class Builder:
         return '<w:p>%s%s%s</w:p>' % (ppr, lead, body)
 
     def comentario(self, cabecalho, corpo, gabarito, comentario):
-        self.add(retext_para(self.f.q_cab, cabecalho, highlight_fgv=False))
-        for linha in corpo:
-            self._linha_questao(self.f.q_corpo, linha)
-        self.add(self._lead_para(self.f.c_gab, 'GABARITO: ', gabarito))
+        corpo = self._limpa_certo_errado(corpo)
+        self._render_sequencia(self._monta_sequencia(cabecalho, corpo))
+        # v7.2: GABARITO + resposta em negrito e CAIXA ALTA, no rótulo
+        gab_txt = re.sub(r'[*_%]', '', str(gabarito)).strip().upper()
+        self.add(self._lead_para(self.f.c_gab, 'GABARITO: ' + gab_txt, ''))
+        # sem vermelho no comentário: %%alerta%% rebaixa para negrito preto
+        comentario = str(comentario).replace('%%', '**')
         self.add(self._lead_para(self.f.c_com, 'COMENTÁRIO: ', comentario))
         self.add(self.f.q_espaco)
 
