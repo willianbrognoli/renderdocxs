@@ -1240,7 +1240,80 @@ _DRAWING_TPL = (
 # documento completo a partir do JSON
 # ---------------------------------------------------------------------------
 
+def _ordena_questoes_por_banca(data):
+    """Reordena questoes/comentarios/gabarito por banca e ano.
+
+    Ordem das bancas: 1) CESPE/CEBRASPE, 2) FGV, 3) demais em ordem
+    alfabética. Dentro de cada banca, ano decrescente (mais novo primeiro);
+    empates preservam a ordem original (sort estável). Depois de ordenar,
+    renumera os cabeçalhos de questoes e comentarios e reconstrói o
+    gabarito com a numeração nova.
+    """
+    questoes = list(data.get('questoes') or [])
+    if not questoes:
+        return data
+    comentarios = list(data.get('comentarios') or [])
+    gabarito = list(data.get('gabarito') or [])
+
+    def _banca_de(cab):
+        m = re.search(r'\(\s*([^/)\n]+?)\s*[/)]', str(cab or ''))
+        return (m.group(1).strip().upper() if m else '')
+
+    def _ano_de(cab):
+        anos = re.findall(r'\b(19\d{2}|20\d{2})\b', str(cab or ''))
+        return int(anos[-1]) if anos else 0
+
+    def _rank_banca(banca):
+        b = re.sub(r'[^A-Z0-9]+', '', banca)
+        if 'CEBRASPE' in b or 'CESPE' in b:
+            return (0, '')
+        if 'FGV' in b:
+            return (1, '')
+        return (2, banca)  # demais: alfabético pelo nome
+
+    # gabarito antigo indexado pelo n (1-based) -> resposta
+    g_por_n = {}
+    for g in gabarito:
+        try:
+            g_por_n[int(g.get('n'))] = g.get('g', '')
+        except (TypeError, ValueError):
+            pass
+
+    idx = list(range(len(questoes)))
+    idx.sort(key=lambda i: (_rank_banca(_banca_de(questoes[i].get('cabecalho'))),
+                            -_ano_de(questoes[i].get('cabecalho')),
+                            i))
+
+    def _renumera(cab, novo_n):
+        s = str(cab or '')
+        novo, feito = re.subn(r'^\s*\d+\s*[.)\-]?', '%d.' % novo_n, s, count=1)
+        return novo if feito else ('%d. %s' % (novo_n, s.strip()))
+
+    novas_q, novos_c, novo_g = [], [], []
+    for pos, i in enumerate(idx):
+        n = pos + 1
+        q = dict(questoes[i])
+        q['cabecalho'] = _renumera(q.get('cabecalho'), n)
+        novas_q.append(q)
+        if i < len(comentarios) and comentarios[i]:
+            c = dict(comentarios[i])
+            c['cabecalho'] = _renumera(c.get('cabecalho'), n)
+            novos_c.append(c)
+            resp = g_por_n.get(i + 1, c.get('gabarito', ''))
+        else:
+            resp = g_por_n.get(i + 1, '')
+        m = re.match(r'^\s*letra\s*([A-Ea-e])\s*$', str(resp or ''))
+        novo_g.append({'n': n, 'g': m.group(1).upper() if m else str(resp or '')})
+
+    data['questoes'] = novas_q
+    if comentarios:
+        data['comentarios'] = novos_c
+    data['gabarito'] = novo_g
+    return data
+
+
 def build_document(data, frag=None, prebuilt=None):
+    data = _ordena_questoes_por_banca(data)
     f = frag or harvest()
     b = prebuilt or Builder(f)
     b.cover(data['titulo'])
