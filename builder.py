@@ -1331,16 +1331,54 @@ class Builder:
         body = make_runs(body_text, base_rpr, highlight_fgv=False)
         return '<w:p>%s%s%s</w:p>' % (ppr, lead, body)
 
+    _SHD_RE = re.compile(r'<w:shd [^>]*?w:fill="([0-9A-Fa-f]{6})"[^>]*/>')
+
+    def _caixa_comentario(self, paras_xml):
+        """Envolve os parágrafos do comentário numa tabela de célula única,
+        sem bordas, com o sombreamento na CÉLULA (pedido do revisor): assim o
+        fundo estica junto com o texto quando alguém edita o comentário no
+        Word, sem quebrar o alinhamento. O tom do fundo é herdado do
+        sombreamento que o template usava nos parágrafos."""
+        m = self._SHD_RE.search(paras_xml)
+        fill = m.group(1) if m else None
+        if fill:
+            # o fundo agora é da célula: tira o dos parágrafos p/ não duplicar
+            paras_xml = self._SHD_RE.sub('', paras_xml)
+        nenhuma = ('<w:top w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+                   '<w:left w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+                   '<w:bottom w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+                   '<w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+                   '<w:insideH w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+                   '<w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>')
+        tcpr = '<w:tcW w:w="5000" w:type="pct"/>'
+        if fill:
+            tcpr += '<w:shd w:val="clear" w:color="auto" w:fill="%s"/>' % fill
+        return (
+            '<w:tbl><w:tblPr>'
+            '<w:tblW w:w="5000" w:type="pct"/>'
+            '<w:tblBorders>%s</w:tblBorders>'
+            '<w:tblCellMar>'
+            '<w:top w:w="113" w:type="dxa"/><w:left w:w="142" w:type="dxa"/>'
+            '<w:bottom w:w="113" w:type="dxa"/><w:right w:w="142" w:type="dxa"/>'
+            '</w:tblCellMar>'
+            '</w:tblPr>'
+            '<w:tblGrid><w:gridCol w:w="10469"/></w:tblGrid>'
+            '<w:tr><w:tc><w:tcPr>%s</w:tcPr>%s</w:tc></w:tr>'
+            '</w:tbl>' % (nenhuma, tcpr, paras_xml))
+
     def comentario(self, cabecalho, corpo, gabarito, comentario):
         corpo = self._limpa_certo_errado(corpo)
         self._render_sequencia(self._monta_sequencia(cabecalho, corpo))
         # v7.2: GABARITO + resposta em negrito e CAIXA ALTA, no rótulo
         gab_txt = re.sub(r'[*_%]', '', str(gabarito)).strip().upper()
-        self.add(self._lead_para(self.f.c_gab, 'GABARITO: ' + gab_txt, ''))
+        p_gab = self._lead_para(self.f.c_gab, 'GABARITO: ' + gab_txt, '')
         # texto do comentário sai limpo: remove **negrito**, __sublinhado__ e
         # %%vermelho%% — só os rótulos GABARITO:/COMENTÁRIO: ficam em negrito
         comentario = re.sub(r'\*\*|__|%%', '', str(comentario))
-        self.add(self._lead_para(self.f.c_com, 'COMENTÁRIO: ', comentario))
+        p_com = self._lead_para(self.f.c_com, 'COMENTÁRIO: ', comentario)
+        # v10: bloco inteiro numa tabela de 1 célula sem bordas (fundo na
+        # célula acompanha edições sem desalinhar)
+        self.add(self._caixa_comentario(p_gab + p_com))
         self.add(self.f.q_espaco)
 
     def gabarito(self, entradas):
