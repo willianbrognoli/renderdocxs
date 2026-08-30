@@ -19,6 +19,236 @@ from xml.sax.saxutils import escape
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "template.docx")
 
+
+# ---------------------------------------------------------------------------
+# Fórmulas: LaTeX -> OMML (equação nativa do Word)
+# Detecta $...$, $$...$$, \(...\), \[...\] e também LaTeX "cru" (sem
+# delimitadores) no meio do texto, e injeta <m:oMath> no lugar do run.
+# Se as bibliotecas não estiverem instaladas ou a conversão falhar, o texto
+# sai literal, como antes (nunca quebra a renderização).
+#   pip install latex2mathml mathml2omml
+# ---------------------------------------------------------------------------
+try:
+    import latex2mathml.converter as _l2m
+    import mathml2omml as _m2o
+    _MATH_OK = True
+except Exception:
+    _MATH_OK = False
+
+_M_NS = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"'
+_MATH_CACHE = {}
+
+_MATH_DELIM_RE = re.compile(
+    r'(\$\$.+?\$\$'
+    r'|(?<!\$)\$[^$\n]+?\$'
+    r'|\\\(.+?\\\)'
+    r'|\\\[.+?\\\])', re.S)
+
+_LATEX_CMD_RE = re.compile(
+    r'\\(?:dfrac|tfrac|frac|sqrt|bar|hat|vec|overline|underline|sum|prod|'
+    r'int|cdot|times|div|pm|mp|leq|le|geq|ge|neq|ne|approx|equiv|infty|'
+    r'alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|pi|phi|omega|'
+    r'Delta|Sigma|Omega|Pi|log|ln|sin|cos|tan|binom|text|left|right)\b')
+
+_MATH_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+                  '0123456789 _^{}\\+-*/=()|<>!%'
+                  '\u00b7\u03a3\u03a0\u0394\u03a9\u03c3\u03c0\u03b8'
+                  '\u03bb\u00b5\u03bc\u03b1\u03b2\u03b3\u03b4\u03c6'
+                  '\u03c9\u221e\u2264\u2265\u2260\u2248\u221a')
+
+
+def _ilha_latex(text, cmd_start):
+    """Expande, a partir de um comando LaTeX cru, a "ilha" de fórmula ao
+    redor (ex.: 'x = \\frac{...}{n}' dentro de uma frase), sem engolir
+    palavras do texto corrido."""
+    n = len(text)
+
+    def _pontuacao_ok(i):
+        # '.' e ',' só entram na fórmula entre dígitos (decimais: 0,5 / 3.14)
+        return 0 < i < n - 1 and text[i - 1].isdigit() and text[i + 1].isdigit()
+
+    # ---- direita ----
+    j = cmd_start
+    depth = 0
+    while j < n:
+        c = text[j]
+        if c == '{':
+            depth += 1
+            j += 1
+            continue
+        if c == '}':
+            if depth == 0:
+                break
+            depth -= 1
+            j += 1
+            continue
+        if depth > 0:
+            j += 1
+            continue
+        if c in '.,':
+            if not _pontuacao_ok(j):
+                break
+            j += 1
+            continue
+        if c.isalpha() and c.isascii():
+            k = j
+            while k < n and text[k].isalpha() and text[k].isascii():
+                k += 1
+            prev = text[j - 1] if j > 0 else ''
+            if (k - j) >= 3 and prev != '\\':
+                break  # palavra do texto corrido: fórmula termina antes dela
+            if (k - j) < 3 and prev != '\\':
+                # letra(s) solta(s): se logo depois vier palavra de prosa
+                # ("... {n} e pronto"), é conjunção, não variável
+                k2 = k
+                while k2 < n and text[k2] == ' ':
+                    k2 += 1
+                if k2 < n and text[k2].isalpha() and text[k2].isascii():
+                    break
+            j = k
+            continue
+        if c not in _MATH_CHARS:
+            break
+        j += 1
+    fim = j
+
+    # ---- esquerda ----
+    i = cmd_start
+    while i > 0:
+        c = text[i - 1]
+        if c in '{}':
+            break
+        if c in '.,':
+            if not _pontuacao_ok(i - 1):
+                break
+            i -= 1
+            continue
+        if c.isalpha() and c.isascii():
+            k = i - 1
+            while k > 0 and text[k - 1].isalpha() and text[k - 1].isascii():
+                k -= 1
+            if (i - k) >= 3:
+                break
+            i = k
+            continue
+        if c not in _MATH_CHARS:
+            break
+        i -= 1
+    return i, fim
+
+
+def _apara_ilha(ilha):
+    """Limpa as pontas da ilha e garante chaves equilibradas."""
+    ilha = ilha.strip()
+    while ilha and ilha[-1] in '+-*/=(, ':
+        ilha = ilha[:-1]
+    while ilha and ilha[0] in '*/=+), ':
+        ilha = ilha[1:]
+    while ilha:
+        d, estourou = 0, False
+        for ch in ilha:
+            if ch == '{':
+                d += 1
+            elif ch == '}':
+                d -= 1
+                if d < 0:
+                    estourou = True
+                    break
+        if d == 0 and not estourou:
+            break
+        ilha = ilha[:-1].rstrip()
+    return ilha.strip()
+
+
+def _segmentos_cru(text):
+    """Encontra LaTeX sem delimitadores dentro de texto corrido."""
+    segs = []
+    pos = 0     # início do texto ainda não emitido
+    busca = 0   # de onde procurar o próximo comando
+    while True:
+        m = _LATEX_CMD_RE.search(text, busca)
+        if not m:
+            break
+        ini, fim = _ilha_latex(text, m.start())
+        trecho = text[ini:fim]
+        limpo = _apara_ilha(trecho)
+        if (len(limpo) >= 4 and len(limpo) <= 300 and ini >= pos
+                and _LATEX_CMD_RE.search(limpo)):
+            a = ini + trecho.find(limpo)
+            b = a + len(limpo)
+            if a > pos:
+                segs.append(('txt', text[pos:a]))
+            segs.append(('math', limpo))
+            pos = b
+            busca = max(b, m.end())
+        else:
+            busca = m.end()
+    if pos < len(text):
+        segs.append(('txt', text[pos:]))
+    return segs
+
+
+def _segmentos_math(text):
+    """Divide o texto em segmentos [('txt'|'math', trecho)]."""
+    segs = []
+    pos = 0
+    for m in _MATH_DELIM_RE.finditer(text):
+        if m.start() > pos:
+            segs.extend(_segmentos_cru(text[pos:m.start()]))
+        raw = m.group(0)
+        latex = raw[2:-2] if raw.startswith(('$$', '\\(', '\\[')) else raw[1:-1]
+        segs.append(('math', latex.strip()))
+        pos = m.end()
+    if pos < len(text):
+        segs.extend(_segmentos_cru(text[pos:]))
+    return segs
+
+
+_GROUPCHR_FIX_RE = re.compile(
+    r'(<m:groupChrPr>(?:<m:\w+(?: [^>]*)?/>)*)</m:groupChr>')
+
+
+def _conserta_omml(omml):
+    """Corrige bug conhecido do mathml2omml 0.0.2: <m:groupChrPr> fechado
+    como </m:groupChr> (acentos tipo \\bar/\\hat)."""
+    return _GROUPCHR_FIX_RE.sub(r'\1</m:groupChrPr>', omml)
+
+
+def _omml_valido(omml):
+    """Valida o XML antes de injetar no documento; inválido -> descarta."""
+    try:
+        from lxml import etree
+        etree.fromstring(omml.encode('utf-8'))
+        return True
+    except ImportError:
+        return True     # sem lxml não dá para validar: segue o melhor esforço
+    except Exception:
+        return False
+
+
+def _latex_to_omml(latex):
+    """LaTeX -> <m:oMath> (equação nativa). None se não der para converter."""
+    if not _MATH_OK or not latex:
+        return None
+    if latex in _MATH_CACHE:
+        return _MATH_CACHE[latex]
+    omml = None
+    try:
+        mathml = _l2m.convert(latex)
+        omml = _m2o.convert(mathml)
+        if omml.startswith('<m:oMath>'):
+            omml = _conserta_omml(omml)
+            omml = omml.replace('<m:oMath>', '<m:oMath %s>' % _M_NS, 1)
+            if not _omml_valido(omml):
+                omml = None
+        else:
+            omml = None
+    except Exception:
+        omml = None
+    _MATH_CACHE[latex] = omml
+    return omml
+
+
 P_RE = re.compile(r'<w:p(?: [^>]*)?>.*?</w:p>', re.S)
 T_RE = re.compile(r'<w:t[^>]*>([^<]*)</w:t>')
 RUN_RE = re.compile(r'<w:r(?: [^>]*)?>.*?</w:r>', re.S)
@@ -186,14 +416,10 @@ def _with_props(rpr, bold=False, underline=False, color=None):
     return '<w:rPr>%s</w:rPr>' % inner if inner else ''
 
 
-def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
-    """Converte texto com marcas inline em runs:
-    **negrito**  __negrito sublinhado__  %%negrito vermelho%%
-    FGV recebe highlight amarelo."""
-    if bold_rpr is None:
-        bold_rpr = _add_bold(base_rpr)
+def _runs_texto(text, base_rpr, bold_rpr, highlight_fgv):
+    """Marcas inline -> runs (texto já saneado)."""
     out = []
-    for part in _TOKEN_RE.split(_sanitize(text)):
+    for part in _TOKEN_RE.split(text):
         if not part:
             continue
         if part.startswith('**') and part.endswith('**') and len(part) > 4:
@@ -221,6 +447,25 @@ def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
         else:
             out.append('<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r>'
                        % (rpr, escape(txt)))
+    return ''.join(out)
+
+
+def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
+    """Converte texto com marcas inline em runs:
+    **negrito**  __negrito sublinhado__  %%negrito vermelho%%
+    FGV recebe highlight amarelo. Trechos em LaTeX ($...$, \\(...\\) ou
+    LaTeX cru com \\frac, \\bar etc.) viram equações nativas do Word
+    (m:oMath); se a conversão falhar, saem como texto literal."""
+    if bold_rpr is None:
+        bold_rpr = _add_bold(base_rpr)
+    out = []
+    for kind, seg in _segmentos_math(_sanitize(text)):
+        if kind == 'math':
+            omml = _latex_to_omml(seg)
+            if omml:
+                out.append(omml)
+                continue
+        out.append(_runs_texto(seg, base_rpr, bold_rpr, highlight_fgv))
     return ''.join(out)
 
 
@@ -1780,6 +2025,20 @@ def install_embedded_fonts(template_path=TEMPLATE):
     subprocess.run(['fc-cache', '-f', font_dir], capture_output=True)
 
 
+def _lo_math_disponivel():
+    """True se o soffice local tem o componente Math (libsmlo). Sem ele, a
+    conversão docx->PDF descarta as equações (páginas do sumário também podem
+    desviar em materiais com muitas fórmulas)."""
+    for d in ('/usr/lib/libreoffice/program', '/usr/lib64/libreoffice/program',
+              '/opt/libreoffice/program', '/usr/lib/libreoffice/program/../program'):
+        if os.path.isdir(d):
+            try:
+                return any(n.startswith('libsm') for n in os.listdir(d))
+            except OSError:
+                pass
+    return None  # LibreOffice não localizado: sem veredito
+
+
 def paginate_toc(builder, docx_path, template_path=TEMPLATE):
     """Converte para PDF com LibreOffice, localiza a página de cada título e
     regrava o sumário com os números reais."""
@@ -1828,6 +2087,13 @@ def paginate_toc(builder, docx_path, template_path=TEMPLATE):
 
 
 def render(data, out_path, template_path=TEMPLATE, paginate=True):
+    if _MATH_OK and _lo_math_disponivel() is False:
+        import sys
+        print('[builder] AVISO: LibreOffice local SEM libreoffice-math: '
+              'PDFs gerados por este soffice descartam as equações e a '
+              'paginação do sumário pode desviar. Instale libreoffice-math '
+              'na imagem (e confira também o container do conversor de PDF).',
+              file=sys.stderr)
     f = harvest(template_path)
     b = Builder(f)
     imagens = data.get('imagens') or {}
