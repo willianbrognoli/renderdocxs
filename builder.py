@@ -19,6 +19,14 @@ from xml.sax.saxutils import escape
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "template.docx")
 
+# v7.3.1: rótulos fixos das caixas. O template traz "MNEMÔNICO", mas o
+# cliente quer "MNEMÔNICO / BIZU" sempre; o builder reescreve o rótulo ao
+# carregar o fragmento, preservando fonte, cor e caixa-alta da máscara.
+# Para trocar outro rótulo, basta acrescentar aqui (chave = fragmento).
+ROTULOS_BOXES = {
+    'box_mnemonico': 'MNEMÔNICO / BIZU',
+}
+
 
 # ---------------------------------------------------------------------------
 # Fórmulas: LaTeX -> OMML (equação nativa do Word)
@@ -498,6 +506,9 @@ def harvest(template_path=TEMPLATE):
     f.box_dica = find_tbl('DICA RÁPIDA', 'FBF9F1')
     f.box_lei = find_tbl('LETRA DA LEI', 'F2EFE4')
     f.box_juris = find_tbl('JURISPRUDÊNCIA', 'FAF4E6')
+    for _k, _rot in ROTULOS_BOXES.items():            # v7.3.1
+        if hasattr(f, _k):
+            setattr(f, _k, _rotula_box(getattr(f, _k), _rot))
     f.box_aprof = find_tbl('Aprofundando', 'FBF6E4')
     f.box_dialogo = find_tbl('DIÁLOGO EM SALA', 'F7F1DE')
     f.box_diverg = find_tbl('DIVERGÊNCIA', 'F8F2F0')
@@ -653,6 +664,15 @@ def _patch_first_text(xml_frag, new_text):
             return '<w:t xml:space="preserve">%s</w:t>' % escape(new_text)
         return '<w:t xml:space="preserve"></w:t>'
     return T_RE.sub(lambda m: rep(m), xml_frag)
+
+
+def _rotula_box(box_xml, rotulo):
+    """Troca o texto do primeiro parágrafo (rótulo) de uma caixa clonada do
+    template, mantendo runs, rPr e pPr intactos."""
+    ps = _paras(box_xml)
+    if not ps or not rotulo:
+        return box_xml
+    return box_xml.replace(ps[0], _patch_first_text(ps[0], rotulo), 1)
 
 
 class Bookmarks:
