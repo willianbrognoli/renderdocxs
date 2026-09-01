@@ -214,6 +214,139 @@ def _conserta_omml(omml):
     return _GROUPCHR_FIX_RE.sub(r'\1</m:groupChrPr>', omml)
 
 
+# ---------------------------------------------------------------------------
+# v7.3: acentos matemáticos (\bar, \hat, \vec, \tilde, \dot, \overline...).
+# latex2mathml gera <mover>; o mathml2omml 0.0.2 converte <mover> em
+# <m:groupChr> (chave de grupo, tipo \overbrace) ou <m:limUpp> (limite
+# superior, tipo o "n" em cima do somatório). Word e LibreOffice empilham
+# esses construtos com o vão de uma chave/limite: é o "tracinho da média
+# flutuando acima do x" reportado pelo cliente. O construto correto para
+# acento é <m:acc> com o caractere COMBINANTE (U+0305 barra, U+0302 chapéu,
+# U+20D7 vetor...) e, para \overline/\underline de expressões, <m:bar>.
+# Tudo que não é acento (\overbrace, \lim_{x\to 0}, somatórios) fica intacto.
+# ---------------------------------------------------------------------------
+_M_URI = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+_MQ = '{%s}' % _M_URI
+
+# caractere "espaçador" emitido pelo latex2mathml -> combinante da galeria
+# de acentos do Word (Cambria Math renderiza colado à base, no lugar certo)
+_ACENTO_COMBINANTE = {
+    '\u00AF': '\u0305',   # ¯  \bar               -> COMBINING OVERLINE
+    '\u0304': '\u0305',   # macron combinante (se vier)
+    '\u005E': '\u0302',   # ^  \hat \widehat
+    '\u02C6': '\u0302',   # ˆ
+    '\u007E': '\u0303',   # ~  \tilde \widetilde
+    '\u02DC': '\u0303',   # ˜
+    '\u02D9': '\u0307',   # ˙  \dot
+    '\u00A8': '\u0308',   # ¨  \ddot
+    '\u20DB': '\u20DB',   # ⃛  \dddot (já combinante)
+    '\u2192': '\u20D7',   # →  \vec \overrightarrow
+    '\u2190': '\u20D6',   # ←  \overleftarrow
+    '\u2194': '\u20E1',   # ↔  \overleftrightarrow
+    '\u02D8': '\u0306',   # ˘  \breve
+    '\u02C7': '\u030C',   # ˇ  \check
+    '\u00B4': '\u0301',   # ´  \acute
+    '\u0060': '\u0300',   # `  \grave
+    '\u02DA': '\u030A',   # ˚  \mathring
+}
+# barra "longa" que o latex2mathml usa para \overline / \underline
+_BARRA_LONGA = {'\u2015', '\u203E', '\u0332', '\u005F'}
+
+
+def _omml_lim_char(el):
+    """Se <el> contém exatamente um <m:r> com um único caractere, devolve-o."""
+    runs = el.findall('.//' + _MQ + 'r')
+    if len(runs) != 1:
+        return None
+    ts = runs[0].findall(_MQ + 't')
+    if len(ts) != 1:
+        return None
+    txt = (ts[0].text or '').strip()
+    return txt if len(txt) == 1 else None
+
+
+def _omml_novo_acc(etree, chr_comb, base_e):
+    acc = etree.Element(_MQ + 'acc')
+    pr = etree.SubElement(acc, _MQ + 'accPr')
+    c = etree.SubElement(pr, _MQ + 'chr')
+    c.set(_MQ + 'val', chr_comb)
+    acc.append(base_e)
+    return acc
+
+
+def _omml_nova_bar(etree, pos, base_e):
+    bar = etree.Element(_MQ + 'bar')
+    pr = etree.SubElement(bar, _MQ + 'barPr')
+    p = etree.SubElement(pr, _MQ + 'pos')
+    p.set(_MQ + 'val', pos)
+    bar.append(base_e)
+    return bar
+
+
+def _normaliza_acentos_omml(omml):
+    """Reescreve groupChr[top]/limUpp/limLow de acento em m:acc / m:bar.
+    Recebe o <m:oMath ...> já com xmlns:m. Em qualquer erro devolve a
+    entrada intacta (nunca quebra a renderização)."""
+    try:
+        from lxml import etree
+        root = etree.fromstring(omml.encode('utf-8'))
+    except Exception:
+        return omml
+    mudou = False
+
+    def _troca(velho, novo):
+        velho.getparent().replace(velho, novo)
+
+    # 1) groupChr com pos=top e chr de acento -> acc (ou bar p/ barra longa)
+    for g in list(root.iter(_MQ + 'groupChr')):
+        pr = g.find(_MQ + 'groupChrPr')
+        e = g.find(_MQ + 'e')
+        if pr is None or e is None:
+            continue
+        chr_el = pr.find(_MQ + 'chr')
+        pos_el = pr.find(_MQ + 'pos')
+        chr_val = chr_el.get(_MQ + 'val') if chr_el is not None else None
+        pos_val = pos_el.get(_MQ + 'val') if pos_el is not None else 'bot'
+        if pos_val != 'top' or chr_val is None:
+            continue
+        if chr_val in _ACENTO_COMBINANTE:
+            _troca(g, _omml_novo_acc(etree, _ACENTO_COMBINANTE[chr_val], e))
+            mudou = True
+        elif chr_val in _BARRA_LONGA:
+            _troca(g, _omml_nova_bar(etree, 'top', e))
+            mudou = True
+
+    # 2) limUpp cujo "lim" é um único caractere de acento -> acc / bar top
+    for lu in list(root.iter(_MQ + 'limUpp')):
+        e = lu.find(_MQ + 'e')
+        lim = lu.find(_MQ + 'lim')
+        if e is None or lim is None:
+            continue
+        ch = _omml_lim_char(lim)
+        if ch is None:
+            continue
+        if ch in _ACENTO_COMBINANTE:
+            _troca(lu, _omml_novo_acc(etree, _ACENTO_COMBINANTE[ch], e))
+            mudou = True
+        elif ch in _BARRA_LONGA:
+            _troca(lu, _omml_nova_bar(etree, 'top', e))
+            mudou = True
+
+    # 3) limLow cujo "lim" é a barra longa -> bar bot (\underline)
+    for ll in list(root.iter(_MQ + 'limLow')):
+        e = ll.find(_MQ + 'e')
+        lim = ll.find(_MQ + 'lim')
+        if e is None or lim is None:
+            continue
+        if _omml_lim_char(lim) in _BARRA_LONGA:
+            _troca(ll, _omml_nova_bar(etree, 'bot', e))
+            mudou = True
+
+    if not mudou:
+        return omml
+    return etree.tostring(root, encoding='unicode')
+
+
 def _omml_valido(omml):
     """Valida o XML antes de injetar no documento; inválido -> descarta."""
     try:
@@ -241,6 +374,8 @@ def _latex_to_omml(latex):
             omml = omml.replace('<m:oMath>', '<m:oMath %s>' % _M_NS, 1)
             if not _omml_valido(omml):
                 omml = None
+            else:
+                omml = _normaliza_acentos_omml(omml)   # v7.3: \bar, \hat...
         else:
             omml = None
     except Exception:
