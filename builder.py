@@ -807,6 +807,11 @@ class Builder:
         Também espelha a altura no fallback VML (<v:shape style=height:..pt)."""
         def patch(m):
             bloco = m.group(0)
+            # v7.3.1: só a caixa de TEXTO do título cresce. A arte da capa
+            # tem 2 âncoras (caixa "Caixa de Texto 2" + "Imagem 3", o logo);
+            # esticar a imagem deformava o logo.
+            if '<w:txbxContent>' not in bloco:
+                return bloco
             me = re.search(r'<wp:extent cx="\d+" cy="(\d+)"/>', bloco)
             if not me:
                 return bloco
@@ -827,7 +832,12 @@ class Builder:
             st = re.sub(r'margin-top:([\d.-]+)pt',
                         lambda h: 'margin-top:%.2fpt' % (float(h.group(1)) - extra / 25400.0), st)
             return st
-        return re.sub(r'<v:shape [^>]*style="[^"]*"', patch_vml, art)
+        def patch_vml_shape(m):
+            shp = m.group(0)
+            if '<v:textbox' not in shp:
+                return shp
+            return re.sub(r'<v:shape [^>]*style="[^"]*"', patch_vml, shp, count=1)
+        return re.sub(r'<v:shape\b.*?</v:shape>', patch_vml_shape, art, flags=re.S)
 
     def cover(self, titulo):
         self.add(self.f.cover_bg)
