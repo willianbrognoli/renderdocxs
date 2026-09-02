@@ -201,6 +201,7 @@ class RenderRequest(BaseModel):
     data: dict
     filename: str = "material.docx"
     paginate: bool = True
+    update_fields: bool = False   # grava updateFields: Word oferece atualizar sumário ao abrir
 
 
 @app.post("/render")
@@ -209,7 +210,8 @@ def render(req: RenderRequest):
     try:
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, re.sub(r'[^\w. \-]', '_', req.filename) or 'material.docx')
-            builder.render(req.data, out, paginate=req.paginate)
+            status = builder.render(req.data, out, paginate=req.paginate,
+                                    update_fields=req.update_fields)
             with open(out, 'rb') as fh:
                 blob = fh.read()
     except KeyError as e:
@@ -218,8 +220,11 @@ def render(req: RenderRequest):
         raise HTTPException(500, f"falha na renderização: {type(e).__name__}: {e}")
     headers = {
         'Content-Disposition': 'attachment; filename="%s"' % os.path.basename(
-            re.sub(r'[^\w. \-]', '_', req.filename))
+            re.sub(r'[^\w. \-]', '_', req.filename)),
+        'X-Toc-Paginated': 'true' if status.get('toc_paginated') else 'false',
     }
+    if status.get('toc_error'):
+        headers['X-Toc-Error'] = re.sub(r'[^\x20-\x7e]', '?', status['toc_error'])[:200]
     return Response(
         content=blob,
         media_type=('application/vnd.openxmlformats-officedocument.'

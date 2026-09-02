@@ -745,14 +745,19 @@ class Builder:
         return re.sub(r'<w:tc>.*?</w:tc>', lambda m: new_cell, box, count=1, flags=re.S)
 
     # ---------- estrutura ----------
-    # v7.2.4: capa com título longo. A faixa do template comporta 2 linhas a
-    # 22pt; títulos que precisariam de 3+ linhas têm a fonte reduzida até
-    # caberem em 2 linhas (pedido do cliente). Se nem no piso couber,
-    # fallback: estica a faixa mantendo o centro.
+    # v7.3: capa com título SEMPRE a 22pt. O corte acontecia porque a caixa
+    # de texto do template mede só 1.235.869 EMU (~3,4 cm), enquanto a faixa
+    # translúcida da arte de fundo mede ~2,4M EMU (~6,6 cm, de 5,23M a 7,53M
+    # EMU do topo da página). A caixa é transparente e ancorada ao centro, então
+    # basta esticá-la até a altura útil da faixa (mantendo o centro) para o
+    # título caber a 22pt em até ~6 linhas. Só como último recurso, quando nem
+    # a faixa inteira comporta o título, a fonte é reduzida.
     _COVER_CHARS_POR_LINHA = 26   # calibrado na largura útil da caixa a 22pt
     _COVER_SZ_BASE = 44           # 22pt (estilo TtuloCapa)
-    _COVER_SZ_MIN = 28            # 14pt: piso da redução
-    _COVER_EMU_POR_LINHA = 350000  # ~0,97 cm por linha extra (fallback)
+    _COVER_SZ_MIN = 28            # 14pt: piso da redução (só no fallback)
+    _COVER_EMU_POR_LINHA = 350000  # ~0,97 cm por linha a 22pt
+    _COVER_BOX_CY = 2200000        # altura da caixa = altura útil da faixa (~6,1 cm)
+    _COVER_MAX_LINHAS = 6          # linhas a 22pt que cabem na faixa (~156 caracteres)
 
     @classmethod
     def _cover_linhas(cls, titulo, limite=None):
@@ -769,15 +774,15 @@ class Builder:
 
     @classmethod
     def _cover_fit_sz(cls, titulo):
-        """Maior tamanho de fonte (half-points) que faz o título caber em
-        2 linhas; None quando o tamanho do estilo (22pt) já basta."""
-        if cls._cover_linhas(titulo) <= 2:
+        """Fallback apenas: maior tamanho (half-points) que faz o título caber
+        em _COVER_MAX_LINHAS linhas; None quando 22pt já basta (regra)."""
+        if cls._cover_linhas(titulo) <= cls._COVER_MAX_LINHAS:
             return None
         sz = cls._COVER_SZ_BASE
         while sz > cls._COVER_SZ_MIN:
             sz -= 2
             limite = int(cls._COVER_CHARS_POR_LINHA * cls._COVER_SZ_BASE / sz)
-            if cls._cover_linhas(titulo, limite) <= 2:
+            if cls._cover_linhas(titulo, limite) <= cls._COVER_MAX_LINHAS:
                 return sz
         return cls._COVER_SZ_MIN
 
@@ -798,7 +803,8 @@ class Builder:
     @staticmethod
     def _cover_grow(art, extra):
         """Aumenta em `extra` EMU a altura de cada shape ancorada da arte do
-        título e sobe o offset vertical em extra/2 (centro preservado)."""
+        título e sobe o offset vertical em extra/2 (centro preservado).
+        Também espelha a altura no fallback VML (<v:shape style=height:..pt)."""
         def patch(m):
             bloco = m.group(0)
             me = re.search(r'<wp:extent cx="\d+" cy="(\d+)"/>', bloco)
@@ -807,16 +813,25 @@ class Builder:
             cy0 = me.group(1)
             bloco = bloco.replace('cy="%s"' % cy0, 'cy="%d"' % (int(cy0) + extra))
             bloco = re.sub(
-                r'(<wp:positionV[^>]*><wp:posOffset>)(\d+)(</w?p?:?posOffset>)',
-                lambda mm: mm.group(1) + str(max(0, int(mm.group(2)) - extra // 2))
+                r'(<wp:positionV[^>]*><wp:posOffset>)(-?\d+)(</wp:posOffset>)',
+                lambda mm: mm.group(1) + str(int(mm.group(2)) - extra // 2)
                 + mm.group(3),
                 bloco)
             return bloco
-        return re.sub(r'<wp:anchor\b.*?</wp:anchor>', patch, art, flags=re.S)
+        art = re.sub(r'<wp:anchor\b.*?</wp:anchor>', patch, art, flags=re.S)
+
+        def patch_vml(m):
+            st = m.group(0)
+            st = re.sub(r'height:([\d.]+)pt',
+                        lambda h: 'height:%.2fpt' % (float(h.group(1)) + extra / 12700.0), st)
+            st = re.sub(r'margin-top:([\d.-]+)pt',
+                        lambda h: 'margin-top:%.2fpt' % (float(h.group(1)) - extra / 25400.0), st)
+            return st
+        return re.sub(r'<v:shape [^>]*style="[^"]*"', patch_vml, art)
 
     def cover(self, titulo):
         self.add(self.f.cover_bg)
-        sz = self._cover_fit_sz(titulo)
+        sz = self._cover_fit_sz(titulo)   # None na regra (22pt); só fallback
 
         def fix_box(m):
             inner = m.group(0)
@@ -835,12 +850,12 @@ class Builder:
 
         art = re.sub(r'<w:txbxContent>.*?</w:txbxContent>', fix_box,
                      self.f.cover_art, flags=re.S)
-        if sz:
-            limite = int(self._COVER_CHARS_POR_LINHA * self._COVER_SZ_BASE / sz)
-            linhas = self._cover_linhas(titulo, limite)
-            if linhas > 2:
-                art = self._cover_grow(
-                    art, (linhas - 2) * self._COVER_EMU_POR_LINHA)
+        # estica a caixa (transparente, ancorada ao centro) até a altura útil
+        # da faixa: o título fica centrado na faixa com 1 ou 5 linhas.
+        me = re.search(r'<wp:extent cx="\d+" cy="(\d+)"/>', art)
+        cy0 = int(me.group(1)) if me else 0
+        if cy0 and cy0 < self._COVER_BOX_CY:
+            art = self._cover_grow(art, self._COVER_BOX_CY - cy0)
         self.add(art)
 
     def toc_placeholder(self):
@@ -864,7 +879,13 @@ class Builder:
     def banner5(self, titulo):
         name = self.bm.new(titulo, 2)
         self.bm_id += 1
-        self.add(_with_bookmark(self.f.banner_t5, titulo, name, self.bm_id))
+        frag = _with_bookmark(self.f.banner_t5, titulo, name, self.bm_id)
+        # v7.3: o estilo Ttulo5 tem outline 5, fora do campo TOC \o "1-2".
+        # Ao "Atualizar índice inteiro" no Word, a entrada sumia. O nível 2
+        # é forçado por formatação direta (vence o estilo, independe de idioma).
+        frag = re.sub(r'(<w:pStyle w:val="Ttulo5"/>)(?![^<]*<w:outlineLvl)',
+                      r'\1<w:outlineLvl w:val="1"/>', frag, count=1)
+        self.add(frag)
 
     def trim_blanks(self):
         """Remove parágrafos vazios sobrando no fim do fluxo (eles são a
@@ -1608,6 +1629,27 @@ class Builder:
         parts.append(self.f.toc_shell_close)
         return ''.join(parts)
 
+    # v7.3: títulos sempre justificados (título principal, APRESENTAÇÃO,
+    # banners de capítulo/seção e subtítulos). Os fragmentos do template
+    # trazem <w:jc w:val="left"/> e o material saía com títulos de várias
+    # linhas alinhados à esquerda.
+    _JUSTIFY_STYLES = ('Ttulo1', 'Ttulo2', 'Ttulo4', 'Ttulo5')
+
+    @classmethod
+    def _justify_headings(cls, xml):
+        pat = re.compile(r'<w:pPr>(?:(?!</w:pPr>).)*?<w:pStyle w:val="(%s)"/>(?:(?!</w:pPr>).)*?</w:pPr>'
+                         % '|'.join(cls._JUSTIFY_STYLES), re.S)
+
+        def fix(m):
+            ppr = m.group(0)
+            if '<w:jc ' in ppr:
+                return re.sub(r'<w:jc w:val="[^"]*"/>', '<w:jc w:val="both"/>', ppr)
+            # jc entra antes de <w:rPr> (ordem do schema) ou no fim do pPr
+            if '<w:rPr>' in ppr:
+                return ppr.replace('<w:rPr>', '<w:jc w:val="both"/><w:rPr>', 1)
+            return ppr.replace('</w:pPr>', '<w:jc w:val="both"/></w:pPr>', 1)
+        return pat.sub(fix, xml)
+
     def compose(self):
         xml_body = []
         for i, e in enumerate(self.out):
@@ -1615,7 +1657,8 @@ class Builder:
                 xml_body.append(self.render_toc())
             else:
                 xml_body.append(e)
-        return self.f.doc_header + ''.join(xml_body) + self.f.sectpr + self.f.doc_tail
+        body = self._justify_headings(''.join(xml_body))
+        return self.f.doc_header + body + self.f.sectpr + self.f.doc_tail
 
 
 _DROP = object()
@@ -2279,7 +2322,25 @@ def paginate_toc(builder, docx_path, template_path=TEMPLATE):
         return True
 
 
-def render(data, out_path, template_path=TEMPLATE, paginate=True):
+def _set_update_fields(docx_path):
+    """Grava <w:updateFields w:val="true"/> no settings.xml: o Word oferece
+    atualizar todos os campos (sumário) ao abrir o documento."""
+    with zipfile.ZipFile(docx_path) as z:
+        items = {n: z.read(n) for n in z.namelist()}
+    s = items['word/settings.xml'].decode('utf-8')
+    if 'w:updateFields' not in s:
+        s = re.sub(r'(<w:settings\b[^>]*>)', r'\1<w:updateFields w:val="true"/>', s, count=1)
+        items['word/settings.xml'] = s.encode('utf-8')
+    tmp = docx_path + '.tmp'
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+        for n, b in items.items():
+            z.writestr(n, b)
+    os.replace(tmp, docx_path)
+
+
+def render(data, out_path, template_path=TEMPLATE, paginate=True,
+           update_fields=False):
+    """Devolve dict de status: {'toc_paginated': bool, 'toc_error': str|None}."""
     if _MATH_OK and _lo_math_disponivel() is False:
         import sys
         print('[builder] AVISO: LibreOffice local SEM libreoffice-math: '
@@ -2293,14 +2354,28 @@ def render(data, out_path, template_path=TEMPLATE, paginate=True):
     b._img_meta, b._img_media, b._img_rels = prepare_images(imagens, template_path)
     b = build_document(data, f, prebuilt=b)
     write_docx(b, out_path, template_path)
+    status = {'toc_paginated': False, 'toc_error': None}
     if paginate:
         try:
             install_embedded_fonts(template_path)
-            paginate_toc(b, out_path, template_path)
-        except Exception:
-            pass
+            if paginate_toc(b, out_path, template_path):
+                status['toc_paginated'] = True
+            else:
+                status['toc_error'] = 'LibreOffice não gerou o PDF de medição'
+        except Exception as e:
+            status['toc_error'] = '%s: %s' % (type(e).__name__, e)
+        if not status['toc_paginated']:
+            import sys
+            print('[builder] AVISO: sumário SEM números de página: %s'
+                  % status['toc_error'], file=sys.stderr)
     try:
         embed_brand_fonts(out_path)
     except Exception:
         pass
-    return out_path
+    if update_fields or (paginate and not status['toc_paginated']):
+        # sem números medidos, ao menos o Word oferece atualizar ao abrir
+        try:
+            _set_update_fields(out_path)
+        except Exception:
+            pass
+    return status
