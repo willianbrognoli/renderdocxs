@@ -1518,6 +1518,11 @@ class Builder:
         return '<w:p>%s%s%s</w:p>' % (ppr, lead, body)
 
     _SHD_RE = re.compile(r'<w:shd [^>]*?w:fill="([0-9A-Fa-f]{6})"[^>]*/>')
+    _TEXT_W = 10469        # largura útil da página do template (11909 - 2*720)
+    _CAIXA_MARG = 142      # margem interna da caixa de comentário (0,25 cm)
+    _ESP_APOS_COMENTARIO = 3   # v7.3.2: nº de "Espaço Entre Questões" (7pt
+                               # cada) entre o fim do comentário e a próxima
+                               # questão. Antes era 1 (7pt); agora 21pt.
 
     def _caixa_comentario(self, paras_xml):
         """Envolve os parágrafos do comentário numa tabela de célula única,
@@ -1536,21 +1541,29 @@ class Builder:
                    '<w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
                    '<w:insideH w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
                    '<w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>')
-        tcpr = '<w:tcW w:w="5000" w:type="pct"/>'
+        # v7.3.2: a caixa recua o valor da margem interna (142 dxa) para
+        # a esquerda e cresce o mesmo tanto para a direita, de modo que o
+        # TEXTO do comentário fique alinhado com o cabeçalho e o enunciado
+        # (antes o texto entrava 0,25 cm por causa da margem da célula).
+        larg = self._TEXT_W + 2 * self._CAIXA_MARG
+        tcpr = '<w:tcW w:w="%d" w:type="dxa"/>' % larg
         if fill:
             tcpr += '<w:shd w:val="clear" w:color="auto" w:fill="%s"/>' % fill
         return (
             '<w:tbl><w:tblPr>'
-            '<w:tblW w:w="5000" w:type="pct"/>'
+            '<w:tblW w:w="%d" w:type="dxa"/>'
+            '<w:tblInd w:w="-%d" w:type="dxa"/>'
             '<w:tblBorders>%s</w:tblBorders>'
+            '<w:tblLayout w:type="fixed"/>'
             '<w:tblCellMar>'
-            '<w:top w:w="113" w:type="dxa"/><w:left w:w="142" w:type="dxa"/>'
-            '<w:bottom w:w="113" w:type="dxa"/><w:right w:w="142" w:type="dxa"/>'
+            '<w:top w:w="113" w:type="dxa"/><w:left w:w="%d" w:type="dxa"/>'
+            '<w:bottom w:w="113" w:type="dxa"/><w:right w:w="%d" w:type="dxa"/>'
             '</w:tblCellMar>'
             '</w:tblPr>'
-            '<w:tblGrid><w:gridCol w:w="10469"/></w:tblGrid>'
+            '<w:tblGrid><w:gridCol w:w="%d"/></w:tblGrid>'
             '<w:tr><w:tc><w:tcPr>%s</w:tcPr>%s</w:tc></w:tr>'
-            '</w:tbl>' % (nenhuma, tcpr, paras_xml))
+            '</w:tbl>' % (larg, self._CAIXA_MARG, nenhuma, self._CAIXA_MARG,
+                          self._CAIXA_MARG, larg, tcpr, paras_xml))
 
     def comentario(self, cabecalho, corpo, gabarito, comentario):
         corpo = self._limpa_certo_errado(corpo)
@@ -1565,7 +1578,8 @@ class Builder:
         # v10: bloco inteiro numa tabela de 1 célula sem bordas (fundo na
         # célula acompanha edições sem desalinhar)
         self.add(self._caixa_comentario(p_gab + p_com))
-        self.add(self.f.q_espaco)
+        for _ in range(self._ESP_APOS_COMENTARIO):
+            self.add(self.f.q_espaco)
 
     def gabarito(self, entradas):
         tbl = self.f.gabarito_tbl
