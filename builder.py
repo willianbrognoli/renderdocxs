@@ -534,7 +534,7 @@ def harvest(template_path=TEMPLATE):
 
 
 # ---------------------------------------------------------------------------
-# geração de runs com **negrito** e highlight FGV
+# geração de runs com **negrito** (highlight FGV desligado por padrão, v7.3.2)
 # ---------------------------------------------------------------------------
 
 BLOQUEIO_ZERO = True  # travessão proibido em conteúdo gerado
@@ -596,10 +596,10 @@ def _runs_texto(text, base_rpr, bold_rpr, highlight_fgv):
     return ''.join(out)
 
 
-def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
+def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=False):
     """Converte texto com marcas inline em runs:
     **negrito**  __negrito sublinhado__  %%negrito vermelho%%
-    FGV recebe highlight amarelo. Trechos em LaTeX ($...$, \\(...\\) ou
+    Highlight amarelo em FGV desligado por padrão (v7.3.2). Trechos em LaTeX ($...$, \\(...\\) ou
     LaTeX cru com \\frac, \\bar etc.) viram equações nativas do Word
     (m:oMath); se a conversão falhar, saem como texto literal."""
     if bold_rpr is None:
@@ -615,7 +615,7 @@ def make_runs(text, base_rpr, bold_rpr=None, highlight_fgv=True):
     return ''.join(out)
 
 
-def retext_para(para_xml, text, keep_first_n_runs=0, highlight_fgv=True):
+def retext_para(para_xml, text, keep_first_n_runs=0, highlight_fgv=False):
     """Reaproveita o pPr e o rPr do parágrafo modelo, trocando o texto.
     Runs em negrito do modelo viram o bold_rpr; o primeiro run "normal" vira
     o base_rpr."""
