@@ -48,9 +48,22 @@ _MATH_CACHE = {}
 
 _MATH_DELIM_RE = re.compile(
     r'(\$\$.+?\$\$'
-    r'|(?<!\$)\$[^$\n]+?\$'
+    # v7.3.2: "$" colado a letra (R$, US$) nunca abre fórmula
+    r'|(?<![\$A-Za-z])\$[^$\n]+?\$'
     r'|\\\(.+?\\\)'
     r'|\\\[.+?\\\])', re.S)
+
+# v7.3.2: conteúdo entre $...$ que é frase em português (ex.: o trecho entre
+# "R$ 107,00" e "R$ 15,00") não é fórmula. Consideramos fórmula só se tiver
+# comando LaTeX / operador ou se não tiver 3+ palavras alfabéticas seguidas.
+_PALAVRAS_RE = re.compile(r'[A-Za-zÀ-ÿ]{2,}(?:\s+[A-Za-zÀ-ÿ]{2,}){2,}')
+_MATH_SINAL_RE = re.compile(r'[\\^_=+<>]|\\[a-zA-Z]+|\d\s*[*/]\s*\d')
+
+
+def _parece_formula(latex):
+    if _MATH_SINAL_RE.search(latex) and not _PALAVRAS_RE.search(latex):
+        return True
+    return not _PALAVRAS_RE.search(latex)
 
 _LATEX_CMD_RE = re.compile(
     r'\\(?:dfrac|tfrac|frac|sqrt|bar|hat|vec|overline|underline|sum|prod|'
@@ -205,6 +218,10 @@ def _segmentos_math(text):
             segs.extend(_segmentos_cru(text[pos:m.start()]))
         raw = m.group(0)
         latex = raw[2:-2] if raw.startswith(('$$', '\\(', '\\[')) else raw[1:-1]
+        if raw.startswith('$') and not raw.startswith('$$') \
+                and not _parece_formula(latex):
+            # v7.3.2: "$" solto em texto corrido (moeda) -> não é fórmula
+            continue
         segs.append(('math', latex.strip()))
         pos = m.end()
     if pos < len(text):
