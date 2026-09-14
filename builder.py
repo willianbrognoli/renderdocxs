@@ -1329,6 +1329,32 @@ class Builder:
             self.add(retext_para(self.f.caption, legenda))
         self.blank()
 
+    # ---------- v7.3: resumo das fórmulas (última página da teoria) ----------
+    RESUMO_FORMULAS_TITULO = 'RESUMO DAS FÓRMULAS APRESENTADAS'
+
+    def resumo_formulas(self, formulas, intro=None):
+        """Banner + tabela (Fórmula | Expressão | Quando usar) em página
+        própria, fechando a parte teórica. Cada expressão vai entre $...$
+        para o make_runs converter em equação OMML."""
+        linhas = []
+        for f in formulas or []:
+            if not isinstance(f, dict):
+                continue
+            latex = str(f.get('latex') or '').strip().strip('$').strip()
+            if not latex:
+                continue
+            nome = _sanitize(str(f.get('nome') or '').strip()) or 'Fórmula'
+            quando = _sanitize(str(f.get('quando') or f.get('descricao') or '').strip())
+            linhas.append([_boldify(nome), '$' + latex + '$', quando])
+        if not linhas:
+            return False
+        self.banner2(self.RESUMO_FORMULAS_TITULO)
+        self.para(intro or ('Quadro final com todas as fórmulas trabalhadas nesta '
+                            'apostila, na ordem em que aparecem na teoria: use como '
+                            'checklist de revisão antes de resolver as questões.'))
+        self.tabela(['Fórmula', 'Expressão', 'Quando usar'], linhas)
+        return True
+
     # ---------- questões ----------
     _IMG_MARK = re.compile(r'\[IMAGEM (\d+)\]')
 
@@ -1931,6 +1957,63 @@ def _ordena_questoes_por_banca(data):
     return data
 
 
+# v7.3: fallback do resumo de fórmulas. Quando a IA não manda "formulas",
+# o builder garimpa as expressões $...$ da teoria que parecem FÓRMULA
+# (têm "=" e ao menos uma variável/letra grega fora dos comandos LaTeX),
+# descartando contas numéricas de exemplos ($\frac{2{,}71}{2} = 1{,}355$).
+_LATEX_CMD_STRIP_RE = re.compile(r'\\[A-Za-z]+')
+_VAR_RE = re.compile(r'[A-Za-z\u03b1-\u03c9\u0391-\u03a9]')
+
+
+_GREGA_CMD_RE = re.compile(
+    r'\\(?:alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|iota|kappa|'
+    r'lambda|mu|nu|xi|pi|rho|sigma|tau|upsilon|phi|varphi|chi|psi|omega|'
+    r'Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Phi|Psi|Omega|bar|hat|vec|overline)\b')
+
+
+def _e_formula_generica(latex):
+    if '=' not in latex:
+        return False
+    if _GREGA_CMD_RE.search(latex):
+        return True
+    corpo = re.sub(r'\\text\{[^}]*\}', ' ', latex)
+    corpo = _LATEX_CMD_STRIP_RE.sub(' ', corpo)
+    return _VAR_RE.search(corpo) is not None
+
+
+def _colhe_formulas(data, maximo=30):
+    vistos, saida = set(), []
+
+    def _varre(obj, cap):
+        if isinstance(obj, str):
+            for m in _MATH_DELIM_RE.finditer(obj):
+                raw = m.group(0)
+                latex = raw[2:-2] if raw.startswith(('$$', '\\(', '\\[')) else raw[1:-1]
+                latex = latex.strip()
+                if not latex or not _parece_formula(latex) or not _e_formula_generica(latex):
+                    continue
+                chave = re.sub(r'\s+', '', latex)
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                saida.append({'nome': 'Fórmula %d' % (len(saida) + 1),
+                              'latex': latex, 'quando': cap})
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _varre(v, cap)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _varre(v, cap)
+
+    for cap in data.get('capitulos') or []:
+        titulo = str(cap.get('titulo') or '')
+        curto = re.sub(r'^\s*CAP[ÍI]TULO\s+\d+\s*[—\-–:]\s*', '', titulo, flags=re.I).strip()
+        _varre(cap.get('blocos') or [], curto.title() if curto.isupper() else curto)
+        if len(saida) >= maximo:
+            break
+    return saida[:maximo]
+
+
 def build_document(data, frag=None, prebuilt=None):
     data = _ordena_questoes_por_banca(data)
     f = frag or harvest()
@@ -1972,6 +2055,17 @@ def build_document(data, frag=None, prebuilt=None):
                 b.revisao('O QUE ESTUDEI', blk['linhas'])
             elif t == 'imagem':
                 b.imagem(blk.get('ref'), blk.get('legenda'))
+
+    # v7.3: "Resumo das Fórmulas Apresentadas" fecha a teoria (página própria).
+    #   data.formulas = [{nome, latex, quando}]  (preferido, vem da IA)
+    #   data.resumo_formulas = False desliga; 'auto' (padrão) garimpa $...$
+    #   da teoria quando a lista vier vazia.
+    modo = data.get('resumo_formulas', 'auto')
+    if modo is not False:
+        formulas = list(data.get('formulas') or [])
+        if not formulas and modo == 'auto':
+            formulas = _colhe_formulas(data)
+        b.resumo_formulas(formulas, data.get('resumo_formulas_intro'))
 
     b.banner2('QUESTÕES PARA PRATICAR')
     for q in data.get('questoes', []):
