@@ -3,7 +3,7 @@
 
 Endpoints:
   GET  /health            -> status
-  POST /extract           -> multipart docx OU pptx -> {"text": "...", "images": [...]}
+  POST /extract           -> multipart docx, pptx OU pdf -> {"text": "...", "images": [...]}
   POST /render            -> JSON estruturado -> docx diagramado (binário)
 
 O JSON de /render segue o schema documentado no README.
@@ -479,21 +479,256 @@ def _extract_pptx(z):
             "kind": "pptx", "slides": len(slides)}
 
 
+# ---------------------------------------------------------------------------
+# v7.4: /extract também lê PDF (material/questões do professor exportados em PDF)
+# Usa PyMuPDF. Preserva o que dá para recuperar de um PDF:
+#   - texto em vermelho -> %%texto%%  (mesma regra de cor do docx)
+#   - sublinhado        -> __texto__  (detecta a linha/retângulo desenhado sob o texto)
+#   - imagens do corpo  -> [IMAGEM n] no ponto do texto + base64 (>= 3000 bytes)
+# Descarta cabeçalho/rodapé repetido (mesma linha nas margens de >= 60% das páginas)
+# e números de página soltos. Junta palavras hifenizadas na quebra de linha.
+# PDF escaneado (sem camada de texto): tenta OCR se o tesseract estiver no
+# container; senão responde 422 explicando.
+# ---------------------------------------------------------------------------
+_PDF_MARGEM = 0.09          # fração da altura da página considerada cabeçalho/rodapé
+_PDF_MIN_IMG = 3000         # bytes; abaixo disso é ícone/decoração (igual ao docx)
+_PDF_OCR_MIN_CHARS = 40     # menos que isso em todo o PDF = sem camada de texto
+
+
+def _pdf_ocr_disponivel():
+    """OCR só se o tesseract estiver no PATH e tiver o idioma 'por'."""
+    import shutil
+    import subprocess
+    if not shutil.which('tesseract'):
+        return False
+    try:
+        out = subprocess.run(['tesseract', '--list-langs'], capture_output=True, text=True, timeout=20)
+        return 'por' in (out.stdout + out.stderr).split()
+    except Exception:
+        return False
+
+
+def _pdf_eh_vermelho(cor_int):
+    r_, g_, b_ = (cor_int >> 16) & 0xFF, (cor_int >> 8) & 0xFF, cor_int & 0xFF
+    return r_ > 120 and g_ < 90 and b_ < 90
+
+
+def _pdf_sublinhados(page):
+    """Retângulos/linhas horizontais finos desenhados na página (sublinhados
+    do Word/LibreOffice saem como 're' preenchido de ~0,5-1pt de altura)."""
+    out = []
+    try:
+        desenhos = page.get_drawings()
+    except Exception:
+        return out
+    for d in desenhos:
+        for it in d.get('items', []):
+            op = it[0]
+            if op == 're':
+                r = it[1]
+                if r.height <= 2.5 and r.width >= 3:
+                    out.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+            elif op == 'l':
+                p1, p2 = it[1], it[2]
+                if abs(p1.y - p2.y) <= 1.0 and abs(p2.x - p1.x) >= 3:
+                    out.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
+    return out
+
+
+def _pdf_span_sublinhado(bbox, subs):
+    x0, y0, x1, y1 = bbox
+    largura = max(x1 - x0, 1)
+    for sx0, sx1, sy in subs:
+        if y1 - 2.5 <= sy <= y1 + 3.5:
+            inter = min(x1, sx1) - max(x0, sx0)
+            if inter >= 0.5 * largura:
+                return True
+    return False
+
+
+def _pdf_linha_marcada(ln, subs):
+    """Monta o texto de uma linha (rawdict) marcando por CARACTERE:
+    vermelho -> %%..%%, sublinhado -> __..__. O PyMuPDF funde spans vizinhos
+    de mesma fonte/cor, então o sublinhado só é confiável no nível do char."""
+    pedacos = []            # (char, marca) marca in ('', 'v', 's')
+    for sp in ln.get('spans', []):
+        verm = _pdf_eh_vermelho(sp.get('color', 0))
+        for ch in sp.get('chars', []):
+            c = ch.get('c', '')
+            if not c:
+                continue
+            marca = ''
+            if c.strip():
+                if verm:
+                    marca = 'v'
+                elif subs and _pdf_span_sublinhado(ch['bbox'], subs):
+                    marca = 's'
+            pedacos.append((c, marca))
+    # espaço entre dois chars com a mesma marca herda a marca (mantém "__a b__" inteiro)
+    for i in range(1, len(pedacos) - 1):
+        if pedacos[i][1] == '' and not pedacos[i][0].strip() and pedacos[i-1][1] == pedacos[i+1][1] != '':
+            pedacos[i] = (pedacos[i][0], pedacos[i-1][1])
+    out, atual = [], ''
+    tag = {'v': '%%', 's': '__'}
+    for c, m in pedacos:
+        if m != atual:
+            if atual:
+                out.append(tag[atual])
+            if m:
+                out.append(tag[m])
+            atual = m
+        out.append(c)
+    if atual:
+        out.append(tag[atual])
+    return ''.join(out).rstrip()
+
+
+def _pdf_imagem_png(raw, ext):
+    """Devolve (bytes, mime). PNG/JPEG passam direto; outros formatos são
+    reencodados em PNG para o renderizador não engasgar."""
+    import pymupdf
+    ext = (ext or '').lower()
+    if ext in ('png',):
+        return raw, 'image/png'
+    if ext in ('jpg', 'jpeg'):
+        return raw, 'image/jpeg'
+    try:
+        pix = pymupdf.Pixmap(raw)
+        if pix.n - pix.alpha >= 4:          # CMYK -> RGB
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        return pix.tobytes('png'), 'image/png'
+    except Exception:
+        return None, None
+
+
+def _extract_pdf(data):
+    import base64 as b64
+    import hashlib
+    try:
+        import pymupdf
+    except ImportError:
+        raise HTTPException(500, "PyMuPDF não instalado no container (pip install pymupdf)")
+    try:
+        doc = pymupdf.open(stream=data, filetype='pdf')
+    except Exception as e:
+        raise HTTPException(400, f"pdf inválido: {e}")
+    if doc.needs_pass:
+        raise HTTPException(400, "pdf protegido por senha")
+
+    # --- 1ª passada: tem camada de texto? --------------------------------
+    total = sum(len(p.get_text('text').strip()) for p in doc)
+    usar_ocr = False
+    if total < _PDF_OCR_MIN_CHARS:
+        if _pdf_ocr_disponivel():
+            usar_ocr = True
+        else:
+            raise HTTPException(422, "pdf sem camada de texto (escaneado). Exporte o PDF a partir "
+                                     "do Word ou envie o .docx; OCR (tesseract + idioma 'por') "
+                                     "não está habilitado no container.")
+
+    paginas = []          # lista de páginas; cada página = lista de (tipo, texto|imgdict, y0, y1)
+    images, seen = [], {}
+
+    for page in doc:
+        H = page.rect.height
+        subs = [] if usar_ocr else _pdf_sublinhados(page)
+        if usar_ocr:
+            try:
+                tp = page.get_textpage_ocr(language='por', full=True, dpi=200)
+            except Exception as e:
+                raise HTTPException(422, f"OCR falhou na página {page.number + 1}: {e}")
+            d = page.get_text('rawdict', textpage=tp)
+        else:
+            d = page.get_text('rawdict')
+        itens = []
+        for b in d.get('blocks', []):
+            if b.get('type') == 1:                       # imagem
+                raw = b.get('image')
+                if not raw or len(raw) < _PDF_MIN_IMG:
+                    continue
+                h = hashlib.md5(raw).hexdigest()
+                if h in seen:
+                    itens.append(('img', ' [IMAGEM %d]' % seen[h], b['bbox'][1], b['bbox'][3]))
+                    continue
+                conv, mime = _pdf_imagem_png(raw, b.get('ext'))
+                if not conv or len(conv) < _PDF_MIN_IMG:
+                    continue
+                n = len(images) + 1
+                seen[h] = n
+                images.append({'n': n, 'mime': mime, 'base64': b64.b64encode(conv).decode('ascii')})
+                itens.append(('img', ' [IMAGEM %d]' % n, b['bbox'][1], b['bbox'][3]))
+                continue
+            linhas_bloco = []
+            for ln in b.get('lines', []):
+                t = _pdf_linha_marcada(ln, subs)
+                if t.strip():
+                    linhas_bloco.append((t, ln['bbox'][1], ln['bbox'][3]))
+            # junta hifenização na quebra de linha dentro do bloco
+            k = 0
+            while k < len(linhas_bloco) - 1:
+                a, b_ = linhas_bloco[k], linhas_bloco[k + 1]
+                if re.search(r'[A-Za-zÀ-ÿ]-$', a[0]) and re.match(r'^[a-zà-ÿ]', b_[0]):
+                    linhas_bloco[k] = (a[0][:-1] + b_[0], a[1], b_[2])
+                    del linhas_bloco[k + 1]
+                else:
+                    k += 1
+            for t, y0, y1 in linhas_bloco:
+                itens.append(('txt', t, y0, y1))
+        itens.sort(key=lambda it: (round(it[2], 0), 0))   # ordem de leitura (topo -> base), estável
+        paginas.append((H, itens))
+
+    # --- cabeçalho/rodapé repetido e números de página ---------------------
+    n_pag = len(paginas)
+    contagem = {}
+    for H, itens in paginas:
+        vistos = set()
+        for tipo, t, y0, y1 in itens:
+            if tipo != 'txt':
+                continue
+            if y1 <= H * _PDF_MARGEM or y0 >= H * (1 - _PDF_MARGEM):
+                chave = re.sub(r'\d+', '#', t.strip())
+                if chave not in vistos:
+                    vistos.add(chave)
+                    contagem[chave] = contagem.get(chave, 0) + 1
+    limiar = max(3, int(0.6 * n_pag + 0.999)) if n_pag >= 3 else 10 ** 9
+    repetidos = {k for k, v in contagem.items() if v >= limiar}
+
+    lines = []
+    for H, itens in paginas:
+        for tipo, t, y0, y1 in itens:
+            if tipo == 'txt':
+                margem = y1 <= H * _PDF_MARGEM or y0 >= H * (1 - _PDF_MARGEM)
+                if margem:
+                    chave = re.sub(r'\d+', '#', t.strip())
+                    if chave in repetidos or re.fullmatch(r'[\s\-–—]*(página\s*)?\d{1,4}(\s*(de|/)\s*\d{1,4})?[\s\-–—]*', t.strip(), re.I):
+                        continue
+                lines.append(t)
+            else:
+                lines.append(t.strip())
+        lines.append('')                                   # quebra de página = parágrafo
+    text = '\n'.join(lines)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return {"text": text, "chars": len(text), "images": images,
+            "kind": "pdf", "pages": n_pag, "ocr": usar_ocr}
+
+
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     """Extrai texto e imagens de um .docx (transcrição/material) ou de um
-    .pptx (slides do professor). Resposta: {text, chars, images, kind}."""
+    .pptx (slides do professor) ou .pdf (v7.4). Resposta: {text, chars, images, kind}."""
     data = await file.read()
+    if data[:5] == b'%PDF-' or (file.filename or '').lower().endswith('.pdf'):
+        return _extract_pdf(data)
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
         nomes = set(z.namelist())
     except Exception as e:
-        raise HTTPException(400, f"arquivo inválido (não é docx/pptx): {e}")
+        raise HTTPException(400, f"arquivo inválido (não é docx/pptx/pdf): {e}")
     if 'ppt/presentation.xml' in nomes:
         return _extract_pptx(z)
     if 'word/document.xml' in nomes:
         return _extract_docx(z)
-    raise HTTPException(400, "arquivo inválido: esperado .docx ou .pptx")
+    raise HTTPException(400, "arquivo inválido: esperado .docx, .pptx ou .pdf")
 
 
 class RenderRequest(BaseModel):
