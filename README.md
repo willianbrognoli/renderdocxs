@@ -1,29 +1,53 @@
-# Renderizador Águia - Carreiras Policiais
+# renderdocxs
 
-Microserviço que recebe o conteúdo estruturado (JSON) e devolve o .docx
-diagramado exatamente na máscara do modelo (capa, sumário paginado, banners,
-boxes, tabelas, questões, comentadas e gabarito), com highlight amarelo em FGV.
+Microserviço em **Python (FastAPI) + LibreOffice** que transforma conteúdo estruturado em JSON em apostilas `.docx` diagramadas na identidade visual do cliente, prontas para conversão em PDF. Também extrai texto e marcações de arquivos `.docx`, `.pptx` e `.pdf` (com OCR) para alimentar pipelines de IA.
 
-## v7.4 — 2026-09-22 — `/extract` aceita PDF
-- `POST /extract` agora lê **.docx, .pptx ou .pdf** (detecta pelo conteúdo, `%PDF-`, ou pela extensão). Resposta igual: `{text, chars, images, kind}`; para PDF `kind: "pdf"`, mais `pages` e `ocr`.
-- PDF com camada de texto (exportado do Word/LibreOffice): texto **vermelho → `%%..%%`**, **sublinhado → `__..__`** (detecção por caractere, pela linha desenhada sob o texto), imagens do corpo → `[IMAGEM n]` + base64 (>= 3000 bytes, deduplicadas). Cabeçalho/rodapé repetido em >= 60% das páginas e números de página soltos são descartados; hífen na quebra de linha é fundido. Quebra de página vira linha em branco.
-- PDF escaneado (sem texto): OCR com tesseract (`por`) se instalado no container — o Dockerfile já instala; sem OCR, responde **422** explicando. OCR não recupera vermelho/sublinhado.
-- Dependência nova: `pymupdf` (requirements.txt) + `tesseract-ocr tesseract-ocr-por` (Dockerfile). Mesma mudança em `rp/`.
-- Limite: PDFs com duas colunas ou tabelas complexas saem em ordem de leitura aproximada; o .docx continua sendo a entrada preferida.
+Em produção desde 2026 como etapa de renderização de um pipeline n8n que gera materiais didáticos de cursos preparatórios: o fluxo monitora uma pasta no OneDrive, extrai o material bruto do professor, estrutura teoria e questões com um LLM e chama este serviço para montar o documento final. O que antes levava dias de diagramação manual passou a sair em minutos.
 
-## Deploy no easypanel
-1. Crie um serviço do tipo **App > Dockerfile** apontando para este diretório
-   (suba o zip no GitHub ou use o build por upload).
-2. Antes do build, coloque as fontes reais em `fonts/`.
-3. Porta interna: **8000**. Ative HTTPS/domínio.
-4. Recursos sugeridos: 1 vCPU / 1 GB RAM (LibreOffice roda por chamada).
+## O que ele faz
+
+- **Renderização fiel ao template**: capa, sumário real paginado, banners de capítulo, subtítulos com moldura, tabelas, caixas (dica, lei, jurisprudência, aprofundando, mnemônico, diálogo, divergência), lista de questões, questões comentadas e gabarito, tudo lendo os fragmentos XML do `template.docx` oficial.
+- **Sumário com paginação correta**: o serviço converte o documento com LibreOffice, mede em que página cada título caiu e grava os números no campo TOC. No Word, F9 também atualiza.
+- **Marcações inline**: `**negrito**`, `__sublinhado__`, `%%vermelho%%` e `[IMAGEM n]` (imagens embutidas em base64).
+- **Matemática**: LaTeX inline (`$...$`) convertido para OMML nativo do Word, incluindo acentos (`\bar`, `\hat`, `\vec`) e proteção contra falsos positivos como `R$`.
+- **Fontes da marca embutidas** em cada documento gerado, garantindo tipografia idêntica em qualquer máquina e na conversão para PDF.
+- **Extração robusta**: `.docx` e `.pptx` (texto, sublinhados, vermelhos, equações OMML linearizadas, imagens) e `.pdf` (PyMuPDF; detecção de sublinhado por caractere, descarte de cabeçalho/rodapé repetido, OCR Tesseract pt-BR para PDF escaneado).
+- **Multi-marca**: a pasta `rp/` contém uma segunda máscara (outra identidade visual) reaproveitando o mesmo builder e o mesmo contrato de API.
+- **Regras determinísticas**: o builder impõe as regras de diagramação do cliente (caixa cinza só no cabeçalho da questão, Certo/Errado sem alternativas, rótulos em negrito preto, títulos justificados, capa até 6 linhas a 22pt) independentemente do que a IA mandar.
+
+## Arquitetura
+
+```
+n8n (orquestração) ──► POST /extract ──► texto + marcas + imagens
+        │
+        ▼ LLM estrutura teoria e questões
+        │
+        └──► POST /render ──► builder.py monta o DOCX a partir do template
+                              └► LibreOffice mede a paginação do sumário
+                                   └► DOCX final ──► Stirling PDF ──► PDF
+```
+
+| Arquivo | Função |
+|---|---|
+| `app.py` | API FastAPI: `/health`, `/extract`, `/render` |
+| `builder.py` | Monta o documento: colhe fragmentos XML do template, aplica marcas, imagens, OMML, tabelas, questões e pagina o sumário |
+| `template.docx` | Máscara oficial (estilos `TtuloCapa`, `Ttulo1`, `Ttulo2`, `Ttulo4`, `Ttulo5`, `Sumrio1/2`) |
+| `fonts/` | Fontes da marca (colocar antes do build) |
+| `rp/` | Segunda marca: `builder_rp.py`, `app.py`, `template.docx`, `Dockerfile` |
+| `Dockerfile` | `python:3.12-slim` + LibreOffice Writer/Math + Tesseract pt-BR |
 
 ## Endpoints
-- `GET /health`
-- `POST /extract` (multipart `file`) -> `{"text": "..."}`
-- `POST /render` (JSON) -> docx binário
 
-## Schema do /render
+| Método | Rota | Entrada | Saída |
+|---|---|---|---|
+| `GET` | `/health` | — | `{"ok": true}` |
+| `POST` | `/extract` | multipart `file` (.docx, .pptx, .pdf) | `{text, chars, images, kind, pages?, ocr?}` |
+| `POST` | `/render` | JSON (schema abaixo) | binário `.docx`; headers `X-Toc-Paginated` e `X-Toc-Error` |
+
+Flag opcional no `/render`: `"update_fields": true` grava `<w:updateFields/>` para o Word oferecer atualizar o sumário ao abrir (ligada automaticamente se a paginação falhar).
+
+## Schema do `/render` (resumo)
+
 ```json
 {
   "filename": "Aula 2 - Poder Disciplinar.docx",
@@ -32,66 +56,83 @@ boxes, tabelas, questões, comentadas e gabarito), com highlight amarelo em FGV.
     "apresentacao": ["parágrafo 1", "parágrafo 2"],
     "capitulos": [
       {"titulo": "CAPÍTULO 1 — ...", "blocos": [
-        {"tipo": "paragrafo", "texto": "texto com **negrito**"},
+        {"tipo": "paragrafo", "texto": "texto com **negrito** e $\\bar{x}=\\frac{a+b}{2}$"},
         {"tipo": "subtitulo", "texto": "..."},
-        {"tipo": "tabela", "colunas": ["A","B","C"], "linhas": [["1","2","3"]], "legenda": "opcional"},
-        {"tipo": "mnemonico", "titulo": "...", "texto": "..."},
+        {"tipo": "tabela", "colunas": ["A","B"], "linhas": [["1","2"]], "legenda": "opcional"},
         {"tipo": "dica", "texto": "..."},
         {"tipo": "lei", "fonte": "Lei 8.112/1990, art. 126", "texto": "..."},
-        {"tipo": "jurisprudencia", "tribunal": "STF", "referencia": "Súmula 18", "texto": "...", "observacao": "opcional"},
+        {"tipo": "jurisprudencia", "tribunal": "STF", "referencia": "Súmula 18", "texto": "..."},
+        {"tipo": "mnemonico", "titulo": "...", "texto": "..."},
         {"tipo": "aprofundando", "titulo": "...", "texto": "..."},
-        {"tipo": "dialogo", "falas": [{"quem": "Aluno", "texto": "..."}, {"quem": "Professor", "texto": "..."}]},
-        {"tipo": "divergencia", "pergunta": "...", "posicoes": [{"rotulo": "Majoritária", "texto": "..."}]},
-        {"tipo": "revisao", "titulo": "O QUE ESTUDEI", "linhas": [{"tema": "...", "itens": ["...", "..."]}]}
+        {"tipo": "dialogo", "falas": [{"quem": "Aluno", "texto": "..."}]},
+        {"tipo": "divergencia", "pergunta": "...", "posicoes": [{"rotulo": "Majoritária", "texto": "..."}]}
       ]}
     ],
     "questoes": [
-      {"cabecalho": "01. (BANCA / Órgão / Ano) Enunciado...", "corpo": ["afirmativa"], "certo_errado": true},
-      {"cabecalho": "02. (FGV / ... ) ...", "corpo": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."]}
+      {"cabecalho": "01. (CEBRASPE / PF / 2024) Julgue o item.", "corpo": ["afirmativa"], "certo_errado": true},
+      {"cabecalho": "02. (FGV / ... )", "corpo": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."]}
     ],
     "comentarios": [
-      {"cabecalho": "01. (BANCA / ...)", "corpo": ["afirmativa"], "gabarito": "Errado", "comentario": "..."}
+      {"cabecalho": "01. (CEBRASPE / ...)", "corpo": ["afirmativa"], "gabarito": "Errado", "comentario": "..."}
     ],
-    "gabarito": [{"n": 1, "g": "Errado"}, {"n": 2, "g": "B"}]
+    "gabarito": [{"n": 1, "g": "Errado"}, {"n": 2, "g": "B"}],
+    "formulas": [{"nome": "Média", "latex": "\\bar{x}=\\frac{\\sum x_i}{n}"}]
   }
 }
 ```
-sem linhas de marcação Certo/Errado (padrão v4), banners, cores e espaçamentos saem idênticos ao modelo.
-O sumário é um campo TOC real: o serviço converte com LibreOffice, mede a página
-de cada título e grava os números; no Word, F9 também atualiza.
 
+## Rodando
 
-## v4 (padrão do PDF de referência)
-- Marcas inline: **negrito**, __negrito sublinhado__, %%negrito vermelho%%. O /extract anota sublinhados e vermelhos do docx fonte com __ e %%.
-- Revisão: moldura dourada, título centrado, 2 colunas (chip escuro com tema em CAIXA ALTA centrado + itens com seta dourada em fonte de corpo, recuo deslocado).
-- Questões sem linhas "Certo (   )/Errado (   )". Banner final: GABARITO FINAL.
-- Títulos de mnemônico e pergunta/rótulos de divergência em preto.
-- Fontes da marca: o builder embute as fontes da pasta `fonts/` do serviço (ou `/usr/share/fonts/truetype/aguia`) dentro de cada docx gerado, garantindo a tipografia correta em qualquer máquina e na conversão para PDF.
-- v6: faces de nome mesclado (ex.: Winner Sans Wide Bold) são retagueadas internamente (name table, OS/2, head) para se registrarem com a família exata usada no documento, garantindo que LibreOffice/Stirling usem a fonte embutida.
-- IMPORTANTE (Stirling): não instale as fontes da marca no container do Stirling. Fonte instalada tem prioridade sobre a embutida, e uma família parcial (sem Regular/Bold) força pesos errados (Thin/ExtraBold). Com o container limpo, o PDF usa as fontes embutidas do docx.
-- v7: revisão no padrão final: moldura esticada até a largura do texto (sectPr), bloco interno centralizado com respiro simétrico, temas centralizados nos chips, itens à esquerda com recuo deslocado, setas pretas, título sempre "O QUE ESTUDEI" (forçado pelo builder) e sem highlight amarelo de banca nas seções de questões.
-- v7.1: fim das páginas em branco. A quebra de capítulo/seção agora usa pageBreakBefore no parágrafo de respiro (no-op quando a página anterior termina cheia) e o builder remove respiros órfãos antes de cada banner. Validado com sweep de 25 comprimentos de conteúdo.
-- v7.1: subtítulo anti-órfão. O subtítulo (tabela de 1 célula no template, sem suporte a keepNext) virou parágrafo com pBdr idêntico + keepNext encadeado: se não couber junto com o conteúdo no fim da página, descem juntos. Validado com sweep de 23 comprimentos.
-- v7.1: revisão polida: linha-respiro invisível garante vão inferior simétrico ao topo (medido 21px/22px), chips sem bordas soltas no primeiro e no último bloco, e box de dica sem vermelho (%%alerta%% rebaixa para negrito preto na dica).
-- v7.1: respiro do subtítulo assimétrico (360 antes, 120 depois): separa do assunto anterior e gruda no próprio conteúdo.
-- v7.1: imagens dentro de questões. Linhas de corpo com o marcador [IMAGEM N] são substituídas pela imagem real (questões com texto de apoio, charge, campanha), tanto em Questões para Praticar quanto nas Comentadas.
-- v7.1: suporte a RLM/matemática no /extract. Equações do editor do Word (OMML) são linearizadas ((a)/(b), a^b, a_b, √(x)) e símbolos de fonte Symbol (w:sym) viram Unicode (∧ ∨ ¬ → ⇒ ∀ ∃ ∈ ∪ ∩ ≤ ≥ ≠ √ ...). Símbolos digitados como texto já passavam normalmente.
+### Docker (recomendado)
 
-## v7.2
-- GABARITO em negrito e CAIXA ALTA nas comentadas: o rótulo e a resposta ("GABARITO: ERRADO", "GABARITO: LETRA B") saem juntos, inteiros em negrito, com uppercase automático aplicado pelo builder. "COMENTÁRIO:" segue em negrito garantido (o builder força <w:b/> nos rótulos mesmo se o run do template mudar).
-- Caixa cinza só no cabeçalho: os prompts dos workflows passaram a mandar em "cabecalho" apenas número + banca + frase de comando (quando existir); enunciado/afirmativa e alternativas vão em "corpo". Sem comando, o cabeçalho termina no ")" e o texto da questão desce sem a caixa.
-- Quadro "O QUE ESTUDEI" descontinuado nos prompts (bloco revisao removido do schema e das regras) e a apresentação não menciona mais o quadro de revisão nem as listas de questões. O builder mantém o suporte ao bloco revisao por compatibilidade, mas ele não é mais gerado.
-- v7.2.1: questão de Certo/Errado nunca lista opções. Linhas que são apenas opção ("C) Certo", "E) Errado", "( ) Certo", "Certo"/"Errado" soltos) são removidas do corpo em 3 camadas: prompt dos workflows, nó "Montar payload do renderizador" (que também força certo_errado=true ao detectar o par) e o próprio builder. Alternativas reais de múltipla escolha (ex.: "A) Certo é afirmar que...") e opções sem o par Certo+Errado não são tocadas.
-- v7.2.4: capa com título longo (estratégia final): quando o título precisaria de 3+ linhas a 22pt, o builder reduz a fonte (em passos de 1pt, piso 14pt) até o título caber em 2 linhas, dentro da faixa original do template. Fallback: se nem no piso couber, a faixa é esticada mantendo o centro. Títulos de até 2 linhas seguem intocados a 22pt.
-- v7.2.3: rótulos GABARITO: e COMENTÁRIO: forçados em negrito PRETO (o builder remove a cor herdada do template e grava 000000). Zero vermelho nas seções de questões. No builder, %%alerta%% rebaixa para negrito preto no cabeçalho/corpo das questões e no texto dos comentários (mesma regra já usada na dica). Nos prompts dos 3 workflows, o %% saiu da lista de marcas válidas do nó de questões e virou proibição explícita. O vermelho segue disponível na parte teórica.
-- v7.2.5: caixa cinza SÓ em "NN. (BANCA / Órgão / Ano)". O builder corta o cabecalho no fecha-parênteses balanceado e move qualquer texto excedente (comando, enunciado) para a primeira linha do corpo, sem caixa: garantia determinística, independente do que a IA mandar. Prompts dos 3 workflows atualizados na mesma direção (cabecalho termina no ")").
-- v7.2.6: cabeçalho padrão CEBRASPE (referência do cliente). Caixa cinza = número + banca + frase de comando quando houver ("... julgue o próximo item."); enunciado/afirmativa descem sem caixa. Sem comando, a caixa fica só em "NN. (BANCA / Órgão / Ano)". Se a IA mandar a questão inteira no cabecalho (corpo vazio), a 1ª frase fica na caixa quando for comando (julgue/assinale) e o resto desce. Prompts dos 3 workflows realinhados.
-- v7.2.6: subtítulo no tamanho do corpo. O estilo Ttulo4 (13pt Winner Sans Wide) aparentava bem maior que o texto; o builder força 12pt nos runs do subtítulo, mantendo caixa alta, negrito, dourado e a moldura.
-- v7.2.7: múltipla escolha com enunciado dentro da caixa. Quando o corpo contém alternativas (A–E), as linhas de enunciado/texto de apoio anteriores à 1ª alternativa sobem para a caixa cinza (como parágrafos sombreados consecutivos); só as alternativas ficam fora. Linhas com [IMAGEM n] permanecem no corpo (imagem não entra em parágrafo sombreado). Certo/Errado inalterado: caixa = banca + comando, afirmativa fora.
-- v7.2.8: moldura do subtítulo alinhada com a coluna. A borda de parágrafo é desenhada `space` (8pt) + espessura para fora do texto e vazava além das margens; o builder agora aplica recuo esquerdo/direito equivalente (em twips), deixando a borda externa flush com o texto do corpo e com a faixa do capítulo. Combina com o texto do subtítulo a 12pt (v7.2.6).
-- v7.2.8b: em questões MC com imagem no texto de apoio, o texto anterior ao marcador [IMAGEM n] também sobe para a caixa; só a imagem (e as alternativas) ficam fora.
+```bash
+# coloque as fontes da marca em fonts/ antes do build
+docker build -t renderdocxs .
+docker run -p 8000:8000 renderdocxs
+curl http://localhost:8000/health
+```
 
-## v7.3
+Para a segunda marca: `docker build -f rp/Dockerfile -t renderdocxs-rp rp/`.
 
-- Acentos matemáticos no lugar certo (\bar, \hat, \vec, \tilde, \dot, \ddot, \overline, \underline...). O mathml2omml converte `<mover>` em `m:groupChr`/`m:limUpp` (chave de grupo / limite superior), e o Word empilha o símbolo bem acima da base — era o "tracinho da média flutuando acima do x". O builder agora reescreve esses construtos em `m:acc` (com o caractere combinante da galeria do Word: U+0305 barra, U+0302 chapéu, U+20D7 vetor...) e `m:bar` para \overline/\underline. \overbrace, \lim_{x\to 0} e somatórios não são tocados. Validado no LibreOffice (mesmo motor do Stirling) com sweep de 14 acentos.
-- Dockerfile: `libreoffice-math` na imagem do renderizador. Sem ele o soffice local descarta as equações no PDF usado para medir o sumário, e a paginação do sumário desvia em materiais com muitas fórmulas (o builder já avisava isso no log).
+### Easypanel
+
+Serviço **App > Dockerfile** apontando para a raiz (ou para `rp/`), porta interna **8000**, 1 vCPU / 1 GB RAM (o LibreOffice roda por chamada). No n8n, chame pela rede interna: `http://<projeto>_renderdocx:8000`.
+
+### Local
+
+```bash
+pip install -r requirements.txt
+sudo apt install libreoffice-writer libreoffice-math tesseract-ocr tesseract-ocr-por
+uvicorn app:app --port 8000
+```
+
+## Testes rápidos
+
+```bash
+# extração
+curl -F "file=@aula.pdf" http://localhost:8000/extract | jq '.kind, .pages, .chars'
+
+# renderização
+curl -X POST http://localhost:8000/render -H "Content-Type: application/json" \
+  -d @exemplo.json -o saida.docx -D -
+```
+
+Se `X-Toc-Paginated: false`, o sumário foi gerado sem números; abra no Word e pressione F9.
+
+## Decisões técnicas que valem registrar
+
+- **Fragmentos XML do template em vez de python-docx puro**: garante que banners, cores e espaçamentos saiam idênticos ao modelo aprovado pelo cliente.
+- **Fontes embutidas e retagueadas**: faces com nome composto (ex.: "Winner Sans Wide Bold") têm a name table reescrita para registrar a família exata usada no documento, evitando que o LibreOffice caia em pesos errados.
+- **Não instalar as fontes da marca no container de conversão PDF**: fonte instalada tem prioridade sobre a embutida; uma família parcial força pesos errados.
+- **Detecção de sublinhado no PDF por caractere**, não por span: o PyMuPDF funde runs sublinhados com vizinhos.
+- **`$` precedido de letra não abre fórmula**: evita que `R$ 100` e `R$ 200` na mesma frase virem uma equação.
+
+## Limitações conhecidas
+
+- PDFs com duas colunas ou tabelas complexas saem em ordem de leitura aproximada; `.docx` continua sendo a entrada preferida.
+- OCR não recupera vermelho nem sublinhado.
+- Se o mesmo conteúdo chegar em `.docx` e `.pdf`, os dois são processados.
+
+## Histórico
+
+Ver [CHANGELOG.md](CHANGELOG.md) para o detalhamento de cada versão (v4 a v7.4).
