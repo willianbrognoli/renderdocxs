@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libreoffice-writer libreoffice-math poppler-utils fontconfig fonts-liberation \
+    libreoffice-writer libreoffice-math poppler-utils tesseract-ocr tesseract-ocr-por fontconfig fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
@@ -13,6 +13,7 @@ COPY builder.py app.py template.docx ./
 COPY fonts/ /usr/share/fonts/truetype/aguia/
 RUN fc-cache -f || true
 
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 RUN pip install --no-cache-dir latex2mathml mathml2omml
