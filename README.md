@@ -4,6 +4,13 @@ Microserviço que recebe o conteúdo estruturado (JSON) e devolve o .docx
 diagramado exatamente na máscara do modelo (capa, sumário paginado, banners,
 boxes, tabelas, questões, comentadas e gabarito), com highlight amarelo em FGV.
 
+## v7.4 — 2026-09-22 — `/extract` aceita PDF
+- `POST /extract` agora lê **.docx, .pptx ou .pdf** (detecta pelo conteúdo, `%PDF-`, ou pela extensão). Resposta igual: `{text, chars, images, kind}`; para PDF `kind: "pdf"`, mais `pages` e `ocr`.
+- PDF com camada de texto (exportado do Word/LibreOffice): texto **vermelho → `%%..%%`**, **sublinhado → `__..__`** (detecção por caractere, pela linha desenhada sob o texto), imagens do corpo → `[IMAGEM n]` + base64 (>= 3000 bytes, deduplicadas). Cabeçalho/rodapé repetido em >= 60% das páginas e números de página soltos são descartados; hífen na quebra de linha é fundido. Quebra de página vira linha em branco.
+- PDF escaneado (sem texto): OCR com tesseract (`por`) se instalado no container — o Dockerfile já instala; sem OCR, responde **422** explicando. OCR não recupera vermelho/sublinhado.
+- Dependência nova: `pymupdf` (requirements.txt) + `tesseract-ocr tesseract-ocr-por` (Dockerfile). Mesma mudança em `rp/`.
+- Limite: PDFs com duas colunas ou tabelas complexas saem em ordem de leitura aproximada; o .docx continua sendo a entrada preferida.
+
 ## Deploy no easypanel
 1. Crie um serviço do tipo **App > Dockerfile** apontando para este diretório
    (suba o zip no GitHub ou use o build por upload).
