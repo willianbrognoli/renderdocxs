@@ -1876,22 +1876,97 @@ def _normaliza_cabecalho_banca(cab):
     return '%s(%s)%s' % (m.group(1), ' / '.join(partes), resto)
 
 
-# ordem oficial das bancas nas seções de questões (definida pelo cliente):
-# CEBRASPE/CESPE, FGV, VUNESP, FCC, AOCP/Instituto AOCP, IBADE, FUNDATEC,
-# IBFC, IDECAN, FUMARC, Instituto AVALIA, FEPESE; demais em ordem alfabética.
-_ORDEM_BANCAS = [('CEBRASPE', 'CESPE'), ('FGV',), ('VUNESP',), ('FCC',),
-                 ('AOCP',), ('IBADE',), ('FUNDATEC',), ('IBFC',),
-                 ('IDECAN',), ('FUMARC',), ('AVALIA',), ('FEPESE',)]
+# v7.5 (14/10/2026): regra de ordenação definida pelo cliente.
+#   1) Banca: CEBRASPE (inclui CESPE) -> FGV -> demais em ordem alfabética
+#      -> questões sem banca identificada (inéditas, autorais, sem cabeçalho).
+#   2) Dentro de cada banca: carreiras policiais e de segurança pública
+#      primeiro, depois carreiras diversas.
+#   3) Dentro de cada grupo de carreira: ano decrescente; sem ano no fim.
+#   Empates preservam a ordem original (sort estável). A mesma ordem vale
+#   para praticar, comentadas e gabarito (renumerados 01, 02, 03...).
+# Substitui a lista fixa anterior (CEBRASPE, FGV, VUNESP, FCC, AOCP, ...).
+_BANCAS_PRIORITARIAS = [('CEBRASPE', 'CESPE'), ('FGV',)]
+_SEM_BANCA = ('INEDIT', 'QUESTAOINEDIT', 'AUTORAL', 'ELABORAD', 'SEMBANCA')
+_UFS = ('AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|'
+        'RO|RR|SC|SP|SE|TO')
+# órgãos/cargos de carreira policial e segurança pública (texto já sem
+# acento, em caixa alta e com pontuação trocada por espaço: PC-DF -> PC DF)
+_CARREIRA_POLICIAL_RE = re.compile(
+    r'\b(?:'
+    r'POLICIA|POLICIAL|POLICIAIS|'
+    r'D?PF|D?PRF|PJC|'
+    r'(?:PC|PM|CBM|BM|PP)\s?(?:' + _UFS + r')|'
+    r'BOMBEIROS?|BRIGADA MILITAR|'
+    r'DEPEN|SENAPPEN|AGEPEN|SUSEPE|PENITENCIARI\w*|AGENTE PENAL|'
+    r'GUARDA (?:CIVIL|MUNICIPAL|METROPOLITANA)|GCM|'
+    r'ABIN|SEGURANCA PUBLICA|SSP|SESP|'
+    r'PERITO CRIMINAL|PERICIA (?:OFICIAL|CRIMINAL|CIENTIFICA)|POLITEC|ITEP|IGP|'
+    r'DELEGAD[OA]|ESCRIVAO|INVESTIGADOR|PAPILOSCOPISTA|SOLDADO'
+    r')\b')
+
+
+def _normaliza_txt(s):
+    """Caixa alta, sem acento, pontuação vira espaço."""
+    import unicodedata
+    s = unicodedata.normalize('NFD', str(s or ''))
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = re.sub(r'[^A-Za-z0-9]+', ' ', s.upper())
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _dentro_parenteses(cab):
+    """Conteúdo do 1º parêntese balanceado do cabeçalho: 'BANCA / Órgão /
+    Ano'. Fica de fora o texto depois do ')' (comando, enunciado), para que
+    'julgue o item sobre atividade policial' não classifique a carreira."""
+    s = str(cab or '')
+    i = s.find('(')
+    if i < 0:
+        return ''
+    depth = 0
+    for k in range(i, len(s)):
+        if s[k] == '(':
+            depth += 1
+        elif s[k] == ')':
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:k]
+    return s[i + 1:]
+
+
+def _rank_banca_v75(banca):
+    """(grupo, nome): 0 CEBRASPE/CESPE, 1 FGV, 2 demais (alfabética pelo
+    nome, sem 'Instituto'/'Fundação' na frente), 3 sem banca."""
+    b = _normaliza_txt(banca)
+    b = re.sub(r'^(?:INSTITUTO|INST|FUNDACAO)\s+', '', b)
+    bc = b.replace(' ', '')
+    if not bc or bc.startswith(_SEM_BANCA):
+        return (3, '')
+    for pos, chaves in enumerate(_BANCAS_PRIORITARIAS):
+        if any(c in bc for c in chaves):
+            return (pos, '')
+    return (2, bc)
+
+
+def _grupo_carreira(cab):
+    """0 = carreira policial / segurança pública; 1 = carreiras diversas."""
+    dentro = _normaliza_txt(_dentro_parenteses(cab))
+    return 0 if _CARREIRA_POLICIAL_RE.search(dentro) else 1
+
+
+def _ano_v75(cab):
+    """Último ano (19xx/20xx) dentro dos parênteses; 0 se não houver
+    (com a ordem decrescente, sem ano vai para o fim do grupo)."""
+    anos = re.findall(r'\b(19\d{2}|20\d{2})\b', _dentro_parenteses(cab))
+    return int(anos[-1]) if anos else 0
 
 
 def _ordena_questoes_por_banca(data):
-    """Reordena questoes/comentarios/gabarito por banca e ano.
+    """Reordena questoes/comentarios/gabarito (regra v7.5 do cliente).
 
-    Ordem das bancas: a lista oficial _ORDEM_BANCAS (CEBRASPE/CESPE, FGV,
-    VUNESP, FCC, AOCP, IBADE, FUNDATEC, IBFC, IDECAN, FUMARC, AVALIA,
-    FEPESE); demais em ordem alfabética depois delas. Dentro de cada
-    banca, ano decrescente (mais novo primeiro);
-    empates preservam a ordem original (sort estável). Depois de ordenar,
+    Banca (CEBRASPE/CESPE, FGV, demais em ordem alfabética, sem banca) ->
+    carreira (policial/segurança pública antes de diversas) -> ano
+    decrescente (sem ano no fim do grupo); empates preservam a ordem
+    original (sort estável). Depois de ordenar,
     renumera os cabeçalhos de questoes e comentarios e reconstrói o
     gabarito com a numeração nova.
     """
@@ -1910,11 +1985,7 @@ def _ordena_questoes_por_banca(data):
         return int(anos[-1]) if anos else 0
 
     def _rank_banca(banca):
-        b = re.sub(r'[^A-Z0-9]+', '', banca)
-        for pos, chaves in enumerate(_ORDEM_BANCAS):
-            if any(c in b for c in chaves):
-                return (pos, '')
-        return (len(_ORDEM_BANCAS), banca)  # demais: alfabético pelo nome
+        return _rank_banca_v75(banca)  # v7.5
 
     # gabarito antigo indexado pelo n (1-based) -> resposta
     g_por_n = {}
@@ -1925,14 +1996,17 @@ def _ordena_questoes_por_banca(data):
             pass
 
     idx = list(range(len(questoes)))
+    # v7.5: banca -> carreira (policial antes de diversas) -> ano decrescente
     idx.sort(key=lambda i: (_rank_banca(_banca_de(questoes[i].get('cabecalho'))),
-                            -_ano_de(questoes[i].get('cabecalho')),
+                            _grupo_carreira(questoes[i].get('cabecalho')),
+                            -_ano_v75(questoes[i].get('cabecalho')),
                             i))
 
     def _renumera(cab, novo_n):
         s = _normaliza_cabecalho_banca(str(cab or ''))
-        novo, feito = re.subn(r'^\s*\d+\s*[.)\-]?', '%d.' % novo_n, s, count=1)
-        return novo if feito else ('%d. %s' % (novo_n, s.strip()))
+        # v7.5: numeração com 2 dígitos (01, 02, 03...), regra do cliente
+        novo, feito = re.subn(r'^\s*\d+\s*[.)\-]?', '%02d.' % novo_n, s, count=1)
+        return novo if feito else ('%02d. %s' % (novo_n, s.strip()))
 
     novas_q, novos_c, novo_g = [], [], []
     for pos, i in enumerate(idx):
