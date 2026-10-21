@@ -2616,5 +2616,10 @@ def render(data, out_path, template_path=TEMPLATE, paginate=True,
         except Exception:
             pass
     # por último: a paginação recopia o template, então os metadados entram no fim
-    _replace_in_zip(out_path, 'docProps/core.xml', _core_props_xml(data).encode('utf-8'))
+    try:
+        _replace_in_zip(out_path, 'docProps/core.xml', _core_props_xml(data).encode('utf-8'))
+    except Exception as e:
+        import sys
+        print('[builder] AVISO: metadados não gravados: %s: %s'
+              % (type(e).__name__, e), file=sys.stderr)
     return status
