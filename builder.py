@@ -2547,6 +2547,34 @@ def _set_update_fields(docx_path):
     os.replace(tmp, docx_path)
 
 
+def _core_props_xml(data):
+    """Metadados próprios de cada material (antes vinham fixos do template.docx)."""
+    from datetime import datetime, timezone
+    meta = data.get('metadados') or {}
+    agora = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    titulo = escape(str(meta.get('titulo') or data.get('titulo') or 'Material'))
+    assunto = escape(str(meta.get('assunto') or 'Águia - Carreiras Policiais'))
+    autor = escape(str(meta.get('autor') or 'Águia - Carreiras Policiais'))
+    palavras = escape(str(meta.get('palavras_chave') or ''))
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties '
+        'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<dc:title>%s</dc:title>'
+        '<dc:subject>%s</dc:subject>'
+        '<dc:creator>%s</dc:creator>'
+        '<cp:keywords>%s</cp:keywords>'
+        '<cp:lastModifiedBy>%s</cp:lastModifiedBy>'
+        '<cp:revision>1</cp:revision>'
+        '<dcterms:created xsi:type="dcterms:W3CDTF">%s</dcterms:created>'
+        '<dcterms:modified xsi:type="dcterms:W3CDTF">%s</dcterms:modified>'
+        '</cp:coreProperties>'
+    ) % (titulo, assunto, autor, palavras, autor, agora, agora)
+
+
 def render(data, out_path, template_path=TEMPLATE, paginate=True,
            update_fields=False):
     """Devolve dict de status: {'toc_paginated': bool, 'toc_error': str|None}."""
@@ -2587,4 +2615,6 @@ def render(data, out_path, template_path=TEMPLATE, paginate=True,
             _set_update_fields(out_path)
         except Exception:
             pass
+    # por último: a paginação recopia o template, então os metadados entram no fim
+    _replace_in_zip(out_path, 'docProps/core.xml', _core_props_xml(data).encode('utf-8'))
     return status
