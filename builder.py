@@ -699,7 +699,7 @@ class Bookmarks:
 
     def new(self, title, level):
         self.n += 1
-        name = '_TocRani2_2%03d' % self.n
+        name = '_TocAguia_%03d' % self.n
         self.items.append((name, title, level))
         return name
 
@@ -2553,8 +2553,8 @@ def _core_props_xml(data):
     meta = data.get('metadados') or {}
     agora = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     titulo = escape(str(meta.get('titulo') or data.get('titulo') or 'Material'))
-    assunto = escape(str(meta.get('assunto') or 'Águia - Carreiras Policiais'))
-    autor = escape(str(meta.get('autor') or 'Águia - Carreiras Policiais'))
+    assunto = escape(str(meta.get('assunto') or data.get('materia') or 'Águia Carreiras Policiais'))
+    autor = escape(str(meta.get('autor') or 'Águia Carreiras Policiais'))
     palavras = escape(str(meta.get('palavras_chave') or ''))
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
